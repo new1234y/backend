@@ -63,8 +63,8 @@ app.get("/api/recap/:id", (req, res) => {
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: corsOrigin, methods: ["GET", "POST"] },
-  pingInterval: 25000,
-  pingTimeout: 20000,
+  pingInterval: 35000,
+  pingTimeout: 90000,
 });
 
 const store = createRoomsStore({
@@ -154,7 +154,7 @@ io.on("connection", (socket) => {
       // Envoyer l'etat actuel selon la phase
       let payload;
       if (room.phase === "lobby") {
-        payload = store.buildLobbyPayload(room);
+        payload = store.buildLobbyPayload(room, io);
         io.to(room.code).emit("lobby_update", payload);
       } else if (room.phase === "role_reveal") {
         payload = store.buildRolesRevealPayload(room);
@@ -163,6 +163,15 @@ io.on("connection", (socket) => {
         store.broadcastPlayingState(io, room);
         payload = store.buildPlayingPayloadForSocket(room, socket.id, io);
       }
+
+      socket.to(room.code).emit("player_reconnected", {
+        nickname: foundPlayer.nickname,
+        sessionId: foundPlayer.sessionId,
+      });
+      store.recordPlayerTimelineReconnect(room.code, {
+        nickname: foundPlayer.nickname,
+        sessionId: foundPlayer.sessionId,
+      });
 
       cb?.({
         ok: true,
@@ -192,7 +201,7 @@ io.on("connection", (socket) => {
         nickname: player.nickname,
       });
 
-      const payload = store.buildLobbyPayload(room);
+      const payload = store.buildLobbyPayload(room, io);
       io.to(room.code).emit("lobby_update", payload);
       cb?.({
         ok: true,
@@ -228,7 +237,7 @@ io.on("connection", (socket) => {
       nickname: player.nickname,
     });
 
-    const payload = store.buildLobbyPayload(room);
+    const payload = store.buildLobbyPayload(room, io);
     io.to(room.code).emit("lobby_update", payload);
     cb?.({
       ok: true,
@@ -245,7 +254,7 @@ io.on("connection", (socket) => {
       cb?.({ ok: false, error: out.error });
       return;
     }
-    const payload = store.buildLobbyPayload(out.room);
+    const payload = store.buildLobbyPayload(out.room, io);
     io.to(out.room.code).emit("lobby_update", payload);
     cb?.({ ok: true, lobby: payload });
   });
@@ -280,6 +289,8 @@ io.on("connection", (socket) => {
     const room = store.getRoomByCode(code);
     if (room?.phase === "playing") {
       store.broadcastPlayingState(io, room);
+    } else if (room?.phase === "lobby") {
+      io.to(room.code).emit("lobby_update", store.buildLobbyPayload(room, io));
     }
   });
 
@@ -331,7 +342,7 @@ io.on("connection", (socket) => {
     if (!ctx) return;
     const { room, player } = ctx;
     if (room.phase === "lobby") {
-      io.to(room.code).emit("lobby_update", store.buildLobbyPayload(room));
+      io.to(room.code).emit("lobby_update", store.buildLobbyPayload(room, io));
       return;
     }
     if (room.phase === "role_reveal") {
@@ -342,6 +353,12 @@ io.on("connection", (socket) => {
       store.appendLocationSample(room, player);
       store.broadcastPlayingState(io, room);
     }
+  });
+
+  socket.on("party_chat_send", (body, cb) => {
+    const r = store.partyChatSend(io, socket.id, body);
+    if (r.error) cb?.({ ok: false, error: r.error });
+    else cb?.({ ok: true });
   });
 
   socket.on("capture_scan", ({ targetSessionId }, cb) => {
@@ -363,16 +380,22 @@ io.on("connection", (socket) => {
     }
 
     const player = room.players.get(socket.id);
-    if (player && (room.phase === "playing" || room.phase === "role_reveal")) {
+    if (player) {
       player.disconnectedAt = Date.now();
       io.to(code).emit("player_disconnected", {
+        nickname: player.nickname,
+        sessionId: player.sessionId,
+      });
+      store.recordPlayerTimelineDisconnect(code, {
         nickname: player.nickname,
         sessionId: player.sessionId,
       });
       store.purgeStaleDisconnects(io, room);
       const r = store.getRoomByCode(code);
       if (!r) return;
-      if (r.phase === "role_reveal") {
+      if (r.phase === "lobby") {
+        io.to(code).emit("lobby_update", store.buildLobbyPayload(r, io));
+      } else if (r.phase === "role_reveal") {
         io.to(code).emit("roles_reveal", store.buildRolesRevealPayload(r));
       } else if (r.phase === "playing") {
         store.broadcastPlayingState(io, r);
@@ -381,11 +404,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    store.leaveRoom(socket.id);
-    const after = store.getRoomByCode(code);
-    if (after && after.players.size > 0) {
-      io.to(code).emit("lobby_update", store.buildLobbyPayload(after));
-    }
+    store.socketToRoom.delete(socket.id);
   });
 });
 

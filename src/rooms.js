@@ -87,6 +87,10 @@ const defaultSettings = () => ({
   /** Fin forcée après X minutes (désactivable) */
   timeLimitEnabled: false,
   timeLimitMinutes: 30,
+  /** random | manual — en manuel, l'hôte définit les chats avant « Démarrer la chasse » */
+  catAssignmentMode: "random",
+  /** Réservé à l'hôte : aperçu carte avec les mêmes cercles que les chats */
+  hostCatMapPreview: false,
 });
 
 /** Paliers de rayon + métadonnées pour l’UI (phase suivante, fin de palier). */
@@ -146,14 +150,6 @@ function isInsideGameZone(lat, lng, room) {
     return isInsideRadius(lat, lng, gc, r);
   }
   return isInsideAnyPolygon(lat, lng, room.settings.cityPolygons);
-}
-
-function countActivePrey(room) {
-  let n = 0;
-  for (const p of room.players.values()) {
-    if (p.role === "player" && !p.captured && !p.spectator) n++;
-  }
-  return n;
 }
 
 function pushTimeline(room, evt) {
@@ -275,6 +271,7 @@ function buildGameSummary(room) {
       originalRole: p.originalRole,
     })),
     colors: { ...(room.playerColors || {}) },
+    partyChat: [...(room.partyChat || [])].slice(-200),
   };
 }
 
@@ -317,6 +314,16 @@ export function createRoomsStore({
   function isDisconnectedGhost(p, io) {
     if (p.disconnectedAt == null) return false;
     return !isSocketConnected(io, p.socketId);
+  }
+
+  function countActivePrey(room, io) {
+    let n = 0;
+    for (const p of room.players.values()) {
+      if (p.role !== "player" || p.captured || p.spectator) continue;
+      if (io && isDisconnectedGhost(p, io)) continue;
+      n++;
+    }
+    return n;
   }
 
   function countConnectedInRoom(io, room) {
@@ -363,12 +370,12 @@ export function createRoomsStore({
       const r = rooms.get(code);
       if (!r || countConnectedInRoom(io, r) > 0) return;
       nukeRoom(io, r, "empty");
-    }, 45_000);
+    }, 12 * 60 * 1000);
     emptyRoomTimers.set(code, id);
   }
 
   function purgeStaleDisconnects(io, room) {
-    const ttlMs = 3 * 60 * 1000;
+    const ttlMs = 30 * 60 * 1000;
     const now = Date.now();
     const toRemove = [];
     for (const [sockId, p] of room.players) {
@@ -410,6 +417,7 @@ export function createRoomsStore({
       lng: null,
       captured: false,
       spectator: false,
+      disconnectedAt: null,
       jamCircleCenter: null,
       jamAnchorLat: null,
       jamAnchorLng: null,
@@ -423,6 +431,7 @@ export function createRoomsStore({
       catMapUnlockAt: null,
       players: new Map([[socketId, player]]),
       pendingJoins: [],
+      partyChat: [],
     };
     rooms.set(code, room);
     socketToRoom.set(socketId, code);
@@ -456,6 +465,7 @@ export function createRoomsStore({
       lng: null,
       captured: false,
       spectator: false,
+      disconnectedAt: null,
       jamCircleCenter: null,
       jamAnchorLat: null,
       jamAnchorLng: null,
@@ -513,6 +523,12 @@ export function createRoomsStore({
     if (partial.shrinkPhases != null) {
       const v = Math.floor(Number(partial.shrinkPhases));
       if (v >= 2 && v <= 20) s.shrinkPhases = v;
+    }
+    if (partial.catAssignmentMode === "random" || partial.catAssignmentMode === "manual") {
+      s.catAssignmentMode = partial.catAssignmentMode;
+    }
+    if (partial.hostCatMapPreview != null) {
+      s.hostCatMapPreview = Boolean(partial.hostCatMapPreview);
     }
     if (partial.zoneMode === "circle" || partial.zoneMode === "city") {
       s.zoneMode = partial.zoneMode;
@@ -592,17 +608,29 @@ export function createRoomsStore({
     room.gameCenter = center;
     room.phase = "role_reveal";
     room.catMapUnlockAt = null;
-    const shuffled = [...list].sort(() => Math.random() - 0.5);
-    shuffled.forEach((p, i) => {
-      const r = i < catCount ? "cat" : "player";
-      p.role = r;
-      p.originalRole = r;
-      p.captured = false;
-      p.spectator = false;
-      p.jamCircleCenter = null;
-      p.jamAnchorLat = null;
-      p.jamAnchorLng = null;
-    });
+    if ((room.settings.catAssignmentMode || "random") === "manual") {
+      list.forEach((p) => {
+        p.role = "player";
+        p.originalRole = "player";
+        p.captured = false;
+        p.spectator = false;
+        p.jamCircleCenter = null;
+        p.jamAnchorLat = null;
+        p.jamAnchorLng = null;
+      });
+    } else {
+      const shuffled = [...list].sort(() => Math.random() - 0.5);
+      shuffled.forEach((p, i) => {
+        const r = i < catCount ? "cat" : "player";
+        p.role = r;
+        p.originalRole = r;
+        p.captured = false;
+        p.spectator = false;
+        p.jamCircleCenter = null;
+        p.jamAnchorLat = null;
+        p.jamAnchorLng = null;
+      });
+    }
     return { ok: true, room };
   }
 
@@ -620,11 +648,22 @@ export function createRoomsStore({
     if (list.length < 2) {
       return { error: "Au moins 2 joueurs sont nécessaires." };
     }
+    if ((room.settings.catAssignmentMode || "random") === "manual") {
+      const { catCount } = room.settings;
+      let cats = 0;
+      for (const p of list) {
+        if (p.role === "cat" && !p.spectator) cats++;
+      }
+      if (cats !== catCount) {
+        return {
+          error: `En mode manuel, choisissez exactement ${catCount} chat(s). Actuellement : ${cats}.`,
+        };
+      }
+    }
     room.phase = "playing";
     room.huntStartedAt = Date.now();
     room.traceBySession = {};
     room.jamHistory = [];
-    room.timelineEvents = [];
     room._lastJamSample = {};
     assignPlayerColors(room);
     pushTimeline(room, {
@@ -668,7 +707,7 @@ export function createRoomsStore({
 
   function checkEndGame(io, room) {
     if (room.phase !== "playing") return;
-    if (countActivePrey(room) === 0) {
+    if (countActivePrey(room, io) === 0) {
       finishGame(io, room, "no_prey_left");
     }
   }
@@ -686,6 +725,7 @@ export function createRoomsStore({
         originalRole: p.originalRole,
       })),
       hostSessionId: room.players.get(room.hostId)?.sessionId ?? null,
+      partyChat: [...(room.partyChat || [])].slice(-80),
     };
   }
 
@@ -706,7 +746,7 @@ export function createRoomsStore({
     return { room, player: p };
   }
 
-  function buildLobbyPayload(room) {
+  function buildLobbyPayload(room, io = null) {
     const host = room.players.get(room.hostId);
     const withGps = [...room.players.values()].filter(
       (pl) => pl.lat != null && pl.lng != null
@@ -719,11 +759,15 @@ export function createRoomsStore({
       players: [...room.players.values()].map((pl) => ({
         sessionId: pl.sessionId,
         nickname: pl.nickname,
+        disconnected: io
+          ? isDisconnectedGhost(pl, io)
+          : Boolean(pl.disconnectedAt),
       })),
       hostSessionId: host?.sessionId ?? null,
       hostHasPosition: host?.lat != null && host?.lng != null,
       canStartGps: withGps >= 1,
       canRevealRoles: n >= 2,
+      partyChat: [...(room.partyChat || [])].slice(-80),
     };
   }
 
@@ -781,6 +825,8 @@ export function createRoomsStore({
         cityPolygons: room.settings.cityPolygons,
         timeLimitEnabled: room.settings.timeLimitEnabled,
         timeLimitMinutes: room.settings.timeLimitMinutes,
+        catAssignmentMode: room.settings.catAssignmentMode || "random",
+        hostCatMapPreview: Boolean(room.settings.hostCatMapPreview),
       },
       gameCenter: center,
       effectiveGlobalRadiusM,
@@ -796,6 +842,7 @@ export function createRoomsStore({
       roster: buildRoster(room, io),
       catMapLocked,
       mapUnlockAt,
+      hostSessionId: room.players.get(room.hostId)?.sessionId ?? null,
       me: {
         sessionId: viewer.sessionId,
         nickname: viewer.nickname,
@@ -811,6 +858,8 @@ export function createRoomsStore({
       catsExact: [],
       preyForCat: [],
       spectators: [],
+      adminPreyPreview: null,
+      partyChat: [...(room.partyChat || [])].slice(-80),
     };
 
     if (catMapLocked) {
@@ -911,6 +960,41 @@ export function createRoomsStore({
       }
     }
 
+    if (
+      viewerSocketId === room.hostId &&
+      room.settings.hostCatMapPreview &&
+      !isCatMapLocked(room, viewer)
+    ) {
+      const prev = [];
+      for (const p of room.players.values()) {
+        if (p.socketId === viewerSocketId) continue;
+        if (p.role !== "player" || p.captured || p.spectator) continue;
+        if (p.lat == null || p.lng == null) continue;
+        const inside = isInsideGameZone(p.lat, p.lng, room);
+        const disc = isDisconnectedGhost(p, io);
+        if (!inside) {
+          prev.push({
+            sessionId: p.sessionId,
+            nickname: p.nickname,
+            kind: "exact",
+            lat: p.lat,
+            lng: p.lng,
+            disconnected: disc,
+          });
+        } else if (p.jamCircleCenter) {
+          prev.push({
+            sessionId: p.sessionId,
+            nickname: p.nickname,
+            kind: "circle",
+            center: p.jamCircleCenter,
+            radiusM: jamRadiusM,
+            disconnected: disc,
+          });
+        }
+      }
+      payload.adminPreyPreview = prev;
+    }
+
     return payload;
   }
 
@@ -1009,7 +1093,7 @@ export function createRoomsStore({
       if (r.players.size === 0) {
         nukeRoom(io, r, "empty");
       } else if (r.phase === "lobby") {
-        io.to(code).emit("lobby_update", buildLobbyPayload(r));
+        io.to(code).emit("lobby_update", buildLobbyPayload(r, io));
       } else if (r.phase === "role_reveal") {
         io.to(code).emit("roles_reveal", buildRolesRevealPayload(r));
       } else if (r.phase === "playing") {
@@ -1064,6 +1148,12 @@ export function createRoomsStore({
       }
     }
     if (room.phase === "role_reveal") {
+      pushTimeline(room, {
+        type: "admin_role_pick",
+        sessionId: target.sessionId,
+        nickname: target.nickname,
+        role: newRole,
+      });
       io.to(code).emit("roles_reveal", buildRolesRevealPayload(room));
     } else if (room.phase === "playing") {
       broadcastPlayingState(io, room);
@@ -1113,11 +1203,11 @@ export function createRoomsStore({
       requestedAt: Date.now(),
     };
     room.pendingJoins.push(pending);
-    const hostSock = io.sockets.sockets.get(room.hostId);
-    hostSock?.emit("join_request_pending", {
+    io.to(room.code).emit("join_request_pending", {
       requestId: pending.id,
       nickname: pending.nickname,
       code: room.code,
+      hostSessionId: room.players.get(room.hostId)?.sessionId ?? null,
     });
     return { ok: true, requestId: pending.id };
   }
@@ -1156,6 +1246,7 @@ export function createRoomsStore({
       lng: null,
       captured: false,
       spectator: false,
+      disconnectedAt: null,
       jamCircleCenter: null,
       jamAnchorLat: null,
       jamAnchorLng: null,
@@ -1177,7 +1268,7 @@ export function createRoomsStore({
       code: room.code,
       isHost: false,
       phase: room.phase,
-      lobby: room.phase === "lobby" ? buildLobbyPayload(room) : null,
+      lobby: room.phase === "lobby" ? buildLobbyPayload(room, io) : null,
       rolesReveal:
         room.phase === "role_reveal" ? buildRolesRevealPayload(room) : null,
       gameState:
@@ -1192,6 +1283,82 @@ export function createRoomsStore({
       joinerSocketId: pending.socketId,
       nickname: pending.nickname,
     };
+  }
+
+  function recordPlayerTimelineDisconnect(code, { nickname, sessionId }) {
+    const room = rooms.get(code);
+    if (!room || room.phase === "finished") return;
+    pushTimeline(room, {
+      type: "player_disconnected",
+      nickname,
+      sessionId,
+    });
+  }
+
+  function recordPlayerTimelineReconnect(code, { nickname, sessionId }) {
+    const room = rooms.get(code);
+    if (!room || room.phase === "finished") return;
+    pushTimeline(room, {
+      type: "player_reconnected",
+      nickname,
+      sessionId,
+    });
+  }
+
+  function partyChatSend(io, socketId, body) {
+    const code = socketToRoom.get(socketId);
+    if (!code) return { error: "Pas dans une salle." };
+    const room = rooms.get(code);
+    if (!room || room.phase === "finished") {
+      return { error: "Discussion indisponible." };
+    }
+    const player = room.players.get(socketId);
+    if (!player) return { error: "Joueur introuvable." };
+    const type = body?.type;
+    if (type !== "text" && type !== "image" && type !== "location") {
+      return { error: "Type de message inconnu." };
+    }
+    const id = uuidv4();
+    const entry = {
+      id,
+      t: Date.now(),
+      sessionId: player.sessionId,
+      nickname: player.nickname,
+      type,
+    };
+    if (type === "text") {
+      const text = String(body.text || "").trim().slice(0, 2000);
+      if (!text) return { error: "Texte vide." };
+      entry.text = text;
+    } else if (type === "image") {
+      const image = String(body.image || "").trim();
+      if (!image.startsWith("data:image/")) {
+        return { error: "Image invalide (data URL requis)." };
+      }
+      if (image.length > 450000) return { error: "Image trop volumineuse." };
+      entry.image = image;
+      const la = Number(body.lat);
+      const lo = Number(body.lng);
+      if (Number.isFinite(la) && Number.isFinite(lo)) {
+        entry.lat = la;
+        entry.lng = lo;
+      }
+    } else {
+      const la = Number(body.lat);
+      const lo = Number(body.lng);
+      if (!Number.isFinite(la) || !Number.isFinite(lo)) {
+        return { error: "Position invalide." };
+      }
+      entry.lat = la;
+      entry.lng = lo;
+    }
+    if (!room.partyChat) room.partyChat = [];
+    room.partyChat.push(entry);
+    if (room.partyChat.length > 400) {
+      room.partyChat.splice(0, room.partyChat.length - 400);
+    }
+    io.to(room.code).emit("party_chat", entry);
+    return { ok: true, entry };
   }
 
   return {
@@ -1218,5 +1385,8 @@ export function createRoomsStore({
     clearRoomAbandonTimer,
     scheduleNukeIfAllAway,
     purgeStaleDisconnects,
+    recordPlayerTimelineDisconnect,
+    recordPlayerTimelineReconnect,
+    partyChatSend,
   };
 }
