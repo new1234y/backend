@@ -32,40 +32,6 @@ function randomCode(len = 5) {
   return s;
 }
 
-function applyCityDifficultyPreset(s, level) {
-  const P = {
-    easy: {
-      jamRadiusM: 100,
-      catDelayMinutes: 6,
-      shrinkZoneEnabled: false,
-      shrinkDurationMinutes: 18,
-      shrinkMinRadiusM: 110,
-      shrinkPhases: 4,
-      timeLimitEnabled: false,
-    },
-    medium: {
-      jamRadiusM: 75,
-      catDelayMinutes: 4,
-      shrinkZoneEnabled: false,
-      shrinkDurationMinutes: 15,
-      shrinkMinRadiusM: 95,
-      shrinkPhases: 5,
-      timeLimitEnabled: true,
-      timeLimitMinutes: 35,
-    },
-    hard: {
-      jamRadiusM: 48,
-      catDelayMinutes: 1,
-      shrinkZoneEnabled: false,
-      shrinkDurationMinutes: 10,
-      shrinkMinRadiusM: 55,
-      shrinkPhases: 8,
-      timeLimitEnabled: true,
-      timeLimitMinutes: 22,
-    },
-  };
-  Object.assign(s, P[level] || P.medium);
-}
 
 const defaultSettings = () => ({
   globalRadiusM: 500,
@@ -78,12 +44,6 @@ const defaultSettings = () => ({
   shrinkMinRadiusM: 100,
   /** Nombre de paliers de rayon (diamètres discrets) */
   shrinkPhases: 5,
-  /** circle | city — en mode city, cityPolygons définit le contour (union) */
-  zoneMode: "circle",
-  /** Tableau d'anneaux [[lat,lng], ...] — union */
-  cityPolygons: [],
-  /** easy | medium | hard — appliqué en mode ville */
-  cityDifficulty: "medium",
   /** Fin forcée après X minutes (désactivable) */
   timeLimitEnabled: false,
   timeLimitMinutes: 30,
@@ -97,7 +57,6 @@ const defaultSettings = () => ({
 function getShrinkState(room) {
   const R0 = Number(room.settings.globalRadiusM) || 500;
   if (
-    room.settings.zoneMode === "city" ||
     !room.settings.shrinkZoneEnabled ||
     !room.huntStartedAt
   ) {
@@ -145,11 +104,7 @@ function getEffectiveGlobalRadius(room) {
 function isInsideGameZone(lat, lng, room) {
   const gc = room.gameCenter;
   const r = getEffectiveGlobalRadius(room);
-  const mode = room.settings.zoneMode === "city" ? "city" : "circle";
-  if (mode !== "city" || !room.settings.cityPolygons?.length) {
-    return isInsideRadius(lat, lng, gc, r);
-  }
-  return isInsideAnyPolygon(lat, lng, room.settings.cityPolygons);
+  return isInsideRadius(lat, lng, gc, r);
 }
 
 function pushTimeline(room, evt) {
@@ -375,7 +330,7 @@ export function createRoomsStore({
   }
 
   function purgeStaleDisconnects(io, room) {
-    const ttlMs = 30 * 60 * 1000;
+    const ttlMs = 5 * 60 * 1000;
     const now = Date.now();
     const toRemove = [];
     for (const [sockId, p] of room.players) {
@@ -449,10 +404,17 @@ export function createRoomsStore({
         return { error: "Cette partie est terminée." };
       }
       return {
-        error: "La partie a déjà commencé. Demandez à l’hôte de vous accepter.",
+        error: "La partie a déjà commencé. Demandez à l'hôte de vous accepter.",
         joinRequestPossible: true,
         roomCode: room.code,
       };
+    }
+    // Check for duplicate nickname
+    const normalizedNickname = String(nickname || "Joueur").slice(0, 24).toLowerCase();
+    for (const player of room.players.values()) {
+      if (player.nickname.toLowerCase() === normalizedNickname) {
+        return { error: "Ce pseudo est déjà utilisé dans cette partie." };
+      }
     }
     const sessionId = uuidv4();
     const player = {
@@ -529,38 +491,6 @@ export function createRoomsStore({
     }
     if (partial.hostCatMapPreview != null) {
       s.hostCatMapPreview = Boolean(partial.hostCatMapPreview);
-    }
-    if (partial.zoneMode === "circle" || partial.zoneMode === "city") {
-      s.zoneMode = partial.zoneMode;
-      if (partial.zoneMode === "city") {
-        applyCityDifficultyPreset(s, s.cityDifficulty || "medium");
-      }
-    }
-    if (
-      partial.cityDifficulty === "easy" ||
-      partial.cityDifficulty === "medium" ||
-      partial.cityDifficulty === "hard"
-    ) {
-      s.cityDifficulty = partial.cityDifficulty;
-      if (s.zoneMode === "city") {
-        applyCityDifficultyPreset(s, partial.cityDifficulty);
-      }
-    }
-    if (partial.cityPolygons != null && Array.isArray(partial.cityPolygons)) {
-      s.cityPolygons = partial.cityPolygons
-        .filter((ring) => Array.isArray(ring) && ring.length >= 3)
-        .map((ring) =>
-          ring
-            .filter(
-              (pt) =>
-                Array.isArray(pt) &&
-                pt.length >= 2 &&
-                Number.isFinite(pt[0]) &&
-                Number.isFinite(pt[1])
-            )
-            .map((pt) => [Number(pt[0]), Number(pt[1])])
-        )
-        .filter((ring) => ring.length >= 3);
     }
     return { ok: true, room };
   }
@@ -706,10 +636,8 @@ export function createRoomsStore({
   }
 
   function checkEndGame(io, room) {
-    if (room.phase !== "playing") return;
-    if (countActivePrey(room, io) === 0) {
-      finishGame(io, room, "no_prey_left");
-    }
+    // Game continues even with only 1 player - only ends on time limit or admin action
+    return;
   }
 
   function buildRolesRevealPayload(room) {
@@ -821,8 +749,6 @@ export function createRoomsStore({
         shrinkDurationMinutes: room.settings.shrinkDurationMinutes,
         shrinkMinRadiusM: room.settings.shrinkMinRadiusM,
         shrinkPhases: room.settings.shrinkPhases,
-        zoneMode: room.settings.zoneMode,
-        cityPolygons: room.settings.cityPolygons,
         timeLimitEnabled: room.settings.timeLimitEnabled,
         timeLimitMinutes: room.settings.timeLimitMinutes,
         catAssignmentMode: room.settings.catAssignmentMode || "random",
