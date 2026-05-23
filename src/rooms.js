@@ -1287,10 +1287,47 @@ export function createRoomsStore({
     return { ok: true, entry };
   }
 
+  function leaveRoomVoluntarily(io, socketId) {
+    const code = socketToRoom.get(socketId);
+    if (!code) return { error: "Pas dans une salle." };
+    const room = rooms.get(code);
+    if (!room) {
+      socketToRoom.delete(socketId);
+      return { error: "Salle introuvable." };
+    }
+    const player = room.players.get(socketId);
+    if (!player) return { error: "Joueur introuvable." };
+
+    const sock = io.sockets.sockets.get(socketId);
+    if (sock) {
+      sock.leave(code);
+    }
+
+    leaveRoom(socketId);
+    io.to(code).emit("player_left", {
+      nickname: player.nickname,
+      sessionId: player.sessionId,
+    });
+
+    const r = rooms.get(code);
+    if (!r) return { ok: true };
+
+    if (r.phase === "lobby") {
+      io.to(code).emit("lobby_update", buildLobbyPayload(r, io));
+    } else if (r.phase === "role_reveal") {
+      io.to(code).emit("roles_reveal", buildRolesRevealPayload(r));
+    } else if (r.phase === "playing") {
+      broadcastPlayingState(io, r);
+    }
+
+    return { ok: true };
+  }
+
   return {
     socketToRoom,
     getRoomByCode,
     leaveRoom,
+    leaveRoomVoluntarily,
     createRoom,
     joinRoom,
     updateSettings,

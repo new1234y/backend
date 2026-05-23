@@ -367,6 +367,12 @@ io.on("connection", (socket) => {
     else cb?.({ ok: true });
   });
 
+  socket.on("leave_room", (_data, cb) => {
+    const r = store.leaveRoomVoluntarily(io, socket.id);
+    if (r.error) cb?.({ ok: false, error: r.error });
+    else cb?.({ ok: true });
+  });
+
   socket.on("disconnect", () => {
     clearInterval(heartbeatInterval);
 
