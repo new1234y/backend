@@ -968,10 +968,6 @@ export function createRoomsStore({
     if (prey.lat == null || prey.lng == null) {
       return { error: "Position de la proie inconnue." };
     }
-    const d = haversineMeters(cat.lat, cat.lng, prey.lat, prey.lng);
-    if (d > CAPTURE_DISTANCE_M) {
-      return { error: `Trop loin (${Math.round(d)} m, max ${CAPTURE_DISTANCE_M} m).` };
-    }
     prey.captured = true;
     prey.spectator = true;
     pushTimeline(room, {
