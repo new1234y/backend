@@ -78,7 +78,6 @@ const store = createRoomsStore({
 setInterval(() => {
   for (const [code, room] of store.rooms || []) {
     if (room.phase === "playing") {
-      store.updateBalises(room, io);
       store.broadcastPlayingState(io, room);
     }
   }
@@ -360,6 +359,20 @@ io.on("connection", (socket) => {
       return;
     }
     if (room.phase === "playing") {
+      if (player.justWentOutOfBounds) {
+        player.justWentOutOfBounds = false;
+        io.to(room.code).emit("player_out_of_bounds", {
+          sessionId: player.sessionId,
+          nickname: player.nickname
+        });
+      }
+      if (player.justReenteredZone) {
+        player.justReenteredZone = false;
+        io.to(room.code).emit("player_reentered_zone", {
+          sessionId: player.sessionId,
+          nickname: player.nickname
+        });
+      }
       store.appendLocationSample(room, player);
       store.broadcastPlayingState(io, room);
     }
@@ -378,6 +391,14 @@ io.on("connection", (socket) => {
   });
 
   socket.on("leave_room", (_data, cb) => {
+    // Find sessionId before leaving
+    const code = store.socketToRoom.get(socket.id);
+    const room = code ? store.getRoomByCode(code) : null;
+    const player = room ? room.players.get(socket.id) : null;
+    if (player?.sessionId) {
+      sessionRegistry.delete(player.sessionId);
+    }
+
     const r = store.leaveRoomVoluntarily(io, socket.id);
     if (r.error) cb?.({ ok: false, error: r.error });
     else cb?.({ ok: true });

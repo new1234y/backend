@@ -8,6 +8,9 @@ import {
 
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CAPTURE_DISTANCE_M = 15;
+const OVERPASS_URL = process.env.OVERPASS_URL || "https://overpass-api.de/api/interpreter";
+const OSM_BALISE_CACHE_TTL_MS = 10 * 60 * 1000;
+const osmBaliseCache = new Map();
 
 const COLOR_PALETTE = [
   "#3b82f6",
@@ -49,6 +52,7 @@ const defaultSettings = () => ({
   timeLimitMinutes: 30,
   /** random | manual — en manuel, l'hôte définit les chats avant « Démarrer la chasse » */
   catAssignmentMode: "random",
+  gameMode: "tag_swap",
   /** Réservé à l'hôte : aperçu carte avec les mêmes cercles que les chats */
   hostCatMapPreview: false,
 });
@@ -189,17 +193,141 @@ function syncJamCircles(room) {
   }
 }
 
-function spawnBalise(room) {
-  if (!room.gameCenter) return;
-  const effectiveRadius = getEffectiveGlobalRadius(room);
-  const baliseRadiusM = 30;
-  const position = randomOffsetPoint(
+function overpassRadiusM(radiusM) {
+  return Math.max(50, Math.min(1200, Math.round(radiusM)));
+}
+
+function osmCacheKey(center, radiusM) {
+  return `${center.lat.toFixed(3)},${center.lng.toFixed(3)},${Math.round(radiusM / 100) * 100}`;
+}
+
+function pointInOsmPolygon(lat, lng, geometry) {
+  if (!Array.isArray(geometry) || geometry.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = geometry.length - 1; i < geometry.length; j = i++) {
+    const yi = Number(geometry[i].lat);
+    const xi = Number(geometry[i].lon);
+    const yj = Number(geometry[j].lat);
+    const xj = Number(geometry[j].lon);
+    if ((yi > lat) !== (yj > lat)) {
+      const xInt = ((xj - xi) * (lat - yi)) / (yj - yi + 1e-18) + xi;
+      if (lng < xInt) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function pickPointOnWayGeometry(geometry) {
+  if (!Array.isArray(geometry) || geometry.length === 0) return null;
+  const idx = Math.floor(Math.random() * geometry.length);
+  const node = geometry[idx];
+  const lat = Number(node.lat);
+  const lng = Number(node.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return { lat, lng };
+}
+
+function isOsmCandidateSafe(candidate, blockedAreas, room, effectiveRadius, baliseRadiusM) {
+  if (!isInsideGameZone(candidate.lat, candidate.lng, room)) return false;
+  if (haversineMeters(candidate.lat, candidate.lng, room.gameCenter.lat, room.gameCenter.lng) > effectiveRadius - baliseRadiusM) return false;
+  for (const area of blockedAreas) {
+    if (pointInOsmPolygon(candidate.lat, candidate.lng, area.geometry)) return false;
+  }
+  return ![...room.players.values()].some((p) => {
+    if (p.lat == null || p.lng == null) return false;
+    return haversineMeters(p.lat, p.lng, candidate.lat, candidate.lng) < Math.max(35, baliseRadiusM);
+  });
+}
+
+async function fetchOsmBaliseCandidates(center, radiusM) {
+  const radius = overpassRadiusM(radiusM);
+  const key = osmCacheKey(center, radius);
+  const cached = osmBaliseCache.get(key);
+  if (cached && Date.now() - cached.at < OSM_BALISE_CACHE_TTL_MS) return cached.data;
+  const query = `[out:json][timeout:8];
+(
+  way(around:${radius},${center.lat},${center.lng})["highway"~"^(footway|path|pedestrian|steps|track|cycleway|bridleway)$"]["access"!~"^(private|no)$"];
+  way(around:${radius},${center.lat},${center.lng})["highway"~"^(residential|service|living_street)$"]["sidewalk"~"^(both|left|right|yes|separate)$"]["access"!~"^(private|no)$"];
+  way(around:${radius},${center.lat},${center.lng})["foot"~"^(yes|designated|permissive)$"]["access"!~"^(private|no)$"];
+  way(around:${radius},${center.lat},${center.lng})["landuse"="residential"];
+  way(around:${radius},${center.lat},${center.lng})["building"];
+);
+out geom;`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 9000);
+  try {
+    const res = await fetch(OVERPASS_URL, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded;charset=UTF-8" },
+      body: `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`Overpass ${res.status}`);
+    const json = await res.json();
+    const elements = Array.isArray(json.elements) ? json.elements : [];
+    const walkways = elements.filter((x) => x.type === "way" && x.tags?.highway && x.geometry?.length);
+    const blockedAreas = elements.filter((x) => x.type === "way" && (x.tags?.landuse === "residential" || x.tags?.building) && x.geometry?.length >= 3);
+    const data = { walkways, blockedAreas };
+    osmBaliseCache.set(key, { at: Date.now(), data });
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function pickOsmBalisePosition(room, effectiveRadius, baliseRadiusM) {
+  try {
+    const { walkways, blockedAreas } = await fetchOsmBaliseCandidates(room.gameCenter, effectiveRadius);
+    const shuffled = [...walkways].sort(() => Math.random() - 0.5);
+    for (const way of shuffled) {
+      for (let i = 0; i < 8; i++) {
+        const candidate = pickPointOnWayGeometry(way.geometry);
+        if (candidate && isOsmCandidateSafe(candidate, blockedAreas, room, effectiveRadius, baliseRadiusM)) {
+          return { ...candidate, source: "osm", osmWayId: way.id };
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("Placement OSM balise indisponible:", e?.message || e);
+  }
+  return null;
+}
+
+function pickFallbackBalisePosition(room, effectiveRadius, baliseRadiusM) {
+  let position = null;
+  for (let i = 0; i < 20; i++) {
+    const candidate = randomOffsetPoint(
+      room.gameCenter.lat,
+      room.gameCenter.lng,
+      Math.max(1, effectiveRadius - baliseRadiusM),
+      0.15,
+      0.9
+    );
+    const tooCloseToPlayer = [...room.players.values()].some((p) => {
+      if (p.lat == null || p.lng == null) return false;
+      return haversineMeters(p.lat, p.lng, candidate.lat, candidate.lng) < Math.max(35, baliseRadiusM);
+    });
+    if (!tooCloseToPlayer) {
+      position = candidate;
+      break;
+    }
+  }
+  return position || randomOffsetPoint(
     room.gameCenter.lat,
     room.gameCenter.lng,
-    effectiveRadius - baliseRadiusM,
-    0.1,
+    Math.max(1, effectiveRadius - baliseRadiusM),
+    0.15,
     0.9
   );
+}
+
+async function spawnBalise(room) {
+  if (!room.gameCenter) return;
+  const effectiveRadius = getEffectiveGlobalRadius(room);
+  const radiusFactor = 0.04 + Math.random() * 0.04;
+  const baliseRadiusM = Math.max(18, Math.min(55, Math.round(effectiveRadius * radiusFactor)));
+  const position = await pickOsmBalisePosition(room, effectiveRadius, baliseRadiusM) ||
+    pickFallbackBalisePosition(room, effectiveRadius, baliseRadiusM);
   
   // Remove all existing balises (only one active at a time)
   room.balises = [];
@@ -209,6 +337,9 @@ function spawnBalise(room) {
     lat: position.lat,
     lng: position.lng,
     radiusM: baliseRadiusM,
+    visualScale: Number((baliseRadiusM / 30).toFixed(2)),
+    placementHint: position.source === "osm" ? "osm_pedestrian_way" : "fallback_random",
+    osmWayId: position.osmWayId || null,
     createdAt: Date.now(),
     expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes lifetime
     capturedBy: null,
@@ -231,8 +362,17 @@ function updateBalises(room, io) {
   
   // Spawn new balise every 5 minutes OR if no balise exists
   if (!room.lastBaliseSpawnAt || now - room.lastBaliseSpawnAt >= baliseSpawnInterval || room.balises.length === 0) {
-    spawnBalise(room);
-    room.lastBaliseSpawnAt = now;
+    if (!room.baliseSpawnPending) {
+      room.baliseSpawnPending = true;
+      room.lastBaliseSpawnAt = now;
+      spawnBalise(room)
+        .catch((e) => {
+          console.warn("Erreur création balise:", e?.message || e);
+        })
+        .finally(() => {
+          room.baliseSpawnPending = false;
+        });
+    }
   }
   
   // Update balise capture progress and check expiration
@@ -313,11 +453,207 @@ function appendLocationSample(room, player) {
   if (arr.length > 6000) arr.splice(0, arr.length - 6000);
 }
 
+function effectiveGlobalRadiusAtTimestamp(room, absT) {
+  const settings = room.settings || {};
+  const R0 = Number(settings.globalRadiusM) || 500;
+  if (!settings.shrinkZoneEnabled || !room.huntStartedAt) return R0;
+  const durMs = Math.max(
+    60000,
+    (Number(settings.shrinkDurationMinutes) || 15) * 60 * 1000
+  );
+  const Rmin = Math.min(
+    R0,
+    Math.max(20, Number(settings.shrinkMinRadiusM) || 80)
+  );
+  const phases = Math.max(
+    2,
+    Math.min(20, Math.floor(Number(settings.shrinkPhases)) || 5)
+  );
+  const elapsed = absT - room.huntStartedAt;
+  if (elapsed <= 0) return R0;
+  const segMs = durMs / phases;
+  const idx = Math.min(
+    phases - 1,
+    Math.floor(elapsed / Math.max(1, segMs))
+  );
+  const ratio = idx / Math.max(1, phases - 1);
+  const radius = R0 + (Rmin - R0) * ratio;
+  return radius > 0 ? radius : R0;
+}
+
+function computePlayerAnalytics(room, timeline) {
+  const trace = room.traceBySession || {};
+  const metrics = {};
+  const jamHistory = room.jamHistory || [];
+  const orderedTimeline = Array.isArray(timeline) ? timeline : [];
+  const jamCountBySession = {};
+  for (const jam of jamHistory) {
+    if (!jam || !jam.sessionId) continue;
+    jamCountBySession[jam.sessionId] = (jamCountBySession[jam.sessionId] || 0) + 1;
+  }
+  const gameCenter = room.gameCenter;
+  const huntStart = room.huntStartedAt != null ? room.huntStartedAt : null;
+  const finishedAt = room.finishedAt != null ? room.finishedAt : null;
+  const effectiveEnd = finishedAt != null ? finishedAt : Date.now();
+  const gameDurationMs =
+    huntStart != null ? Math.max(0, effectiveEnd - huntStart) : null;
+  let totalDistance = 0;
+
+  for (const [sid, points] of Object.entries(trace)) {
+    if (!Array.isArray(points) || points.length === 0) continue;
+    let distance = 0;
+    let totalMs = 0;
+    let maxSpeedMs = 0;
+    let outsideMs = 0;
+    let prev = null;
+    for (const point of points) {
+      if (
+        !point ||
+        !Number.isFinite(point.lat) ||
+        !Number.isFinite(point.lng) ||
+        !Number.isFinite(point.t)
+      ) {
+        prev = null;
+        continue;
+      }
+      if (prev && Number.isFinite(prev.lat) && Number.isFinite(prev.lng)) {
+        const dt = Math.max(1, point.t - prev.t);
+        const d = haversineMeters(prev.lat, prev.lng, point.lat, point.lng);
+        distance += d;
+        totalMs += dt;
+        if (dt > 0) {
+          const speedMs = d / (dt / 1000);
+          if (Number.isFinite(speedMs) && speedMs > maxSpeedMs) {
+            maxSpeedMs = speedMs;
+          }
+        }
+        if (gameCenter) {
+          const radius = effectiveGlobalRadiusAtTimestamp(room, point.t);
+          if (!isInsideRadius(point.lat, point.lng, gameCenter, radius)) {
+            outsideMs += dt;
+          }
+        }
+      }
+      prev = point;
+    }
+    const first = points[0];
+    const last = points[points.length - 1];
+    metrics[sid] = {
+      distanceMeters: Number(distance.toFixed(2)),
+      averageSpeedKmh:
+        totalMs > 0 ? Number(((distance / totalMs) * 3600).toFixed(2)) : 0,
+      maxSpeedKmh: Number((maxSpeedMs * 3.6).toFixed(2)),
+      samples: points.length,
+      totalTrackedMs: totalMs,
+      timeOutsideZoneMs: Math.round(outsideMs),
+      jamEvents: jamCountBySession[sid] || 0,
+      firstSampleAt: first?.t ?? null,
+      lastSampleAt: last?.t ?? null,
+      lastKnownPosition: last
+        ? { lat: last.lat, lng: last.lng, at: last.t }
+        : null,
+    };
+    totalDistance += distance;
+  }
+
+  const eventsBySession = {};
+  for (const ev of orderedTimeline) {
+    if (!ev || !ev.sessionId) continue;
+    if (!eventsBySession[ev.sessionId]) eventsBySession[ev.sessionId] = [];
+    eventsBySession[ev.sessionId].push({
+      type: ev.type,
+      t: ev.t,
+      by: ev.byNickname || null,
+    });
+  }
+
+  let totalCatTimeMs = 0;
+  const playersArray = [...room.players.values()];
+  for (const player of playersArray) {
+    const sid = player.sessionId;
+    if (!metrics[sid]) {
+      metrics[sid] = {
+        distanceMeters: 0,
+        averageSpeedKmh: 0,
+        maxSpeedKmh: 0,
+        samples: 0,
+        totalTrackedMs: 0,
+        timeOutsideZoneMs: 0,
+        jamEvents: jamCountBySession[sid] || 0,
+        firstSampleAt: null,
+        lastSampleAt: null,
+        lastKnownPosition: null,
+      };
+    }
+    const catTime = player.catTimeMs || 0;
+    totalCatTimeMs += catTime;
+    const playerEvents = eventsBySession[sid] || [];
+    metrics[sid] = {
+      ...metrics[sid],
+      nickname: player.nickname,
+      originalRole: player.originalRole,
+      finalRole: player.role,
+      spectator: Boolean(player.spectator),
+      captured: Boolean(player.captured),
+      coins: player.coins || 0,
+      catTimeMs: catTime,
+      timeAsPlayerMs:
+        gameDurationMs != null ? Math.max(0, gameDurationMs - catTime) : null,
+      eventLog: playerEvents,
+      catTransitions: playerEvents
+        .filter((e) => e.type === "became_cat")
+        .map((e) => e.t),
+      capturedAt:
+        playerEvents.find((e) => e.type === "captured")?.t ?? null,
+    };
+  }
+
+  const catTimeRanking = playersArray
+    .map((p) => ({
+      sessionId: p.sessionId,
+      catTimeMs: metrics[p.sessionId]?.catTimeMs || 0,
+    }))
+    .sort((a, b) => a.catTimeMs - b.catTimeMs);
+
+  const infectionOrder = orderedTimeline
+    .filter((ev) => ev.type === "became_cat" && ev.sessionId)
+    .map((ev) => ev.sessionId);
+
+  const capturedOrder = orderedTimeline
+    .filter((ev) => ev.type === "captured" && ev.sessionId)
+    .map((ev) => ev.sessionId);
+
+  const survivors = playersArray.filter(
+    (p) => !p.spectator && !p.captured && p.role === "player"
+  );
+
+  return {
+    players: metrics,
+    game: {
+      mode: room.settings?.gameMode || "tag_swap",
+      huntStartedAt: room.huntStartedAt || null,
+      endedAt: room.finishedAt || null,
+      durationMs: gameDurationMs,
+      totalDistanceMeters: Number(totalDistance.toFixed(2)),
+      totalCatTimeMs,
+      totalJamEvents: jamHistory.length,
+      playerCount: playersArray.filter((p) => !p.spectator).length,
+      catTimeRanking,
+      infectionOrder,
+      capturedOrder,
+      lastSurvivorSessionId:
+        survivors.length === 1 ? survivors[0].sessionId : null,
+    },
+  };
+}
+
 function buildGameSummary(room) {
   const paths = {};
   for (const [sid, pts] of Object.entries(room.traceBySession || {})) {
     paths[sid] = pts.map((x) => ({ ...x }));
   }
+  const timeline = [...(room.timelineEvents || [])].sort((a, b) => a.t - b.t);
+  const analytics = computePlayerAnalytics(room, timeline);
   return {
     code: room.code,
     huntStartedAt: room.huntStartedAt,
@@ -326,17 +662,32 @@ function buildGameSummary(room) {
     globalRadiusM: room.settings.globalRadiusM,
     jamRadiusM: room.settings.jamRadiusM,
     settingsSnapshot: { ...room.settings },
-    timeline: [...(room.timelineEvents || [])].sort((a, b) => a.t - b.t),
+    timeline,
     paths,
     jamHistory: [...(room.jamHistory || [])],
-    players: [...room.players.values()].map((p) => ({
-      sessionId: p.sessionId,
-      nickname: p.nickname,
-      role: p.role,
-      originalRole: p.originalRole,
-    })),
+    players: [...room.players.values()].map((p) => {
+      const playerAnalytics = analytics.players[p.sessionId] || {};
+      return {
+        sessionId: p.sessionId,
+        nickname: p.nickname,
+        role: p.role,
+        originalRole: p.originalRole,
+        spectator: Boolean(p.spectator),
+        captured: Boolean(p.captured),
+        coins: p.coins || 0,
+        totalCatTimeMs:
+          playerAnalytics.catTimeMs != null
+            ? playerAnalytics.catTimeMs
+            : p.catTimeMs || 0,
+        totalPlayerTimeMs:
+          playerAnalytics.timeAsPlayerMs != null
+            ? playerAnalytics.timeAsPlayerMs
+            : null,
+      };
+    }),
     colors: { ...(room.playerColors || {}) },
     partyChat: [...(room.partyChat || [])].slice(-200),
+    analytics,
   };
 }
 
@@ -369,6 +720,9 @@ export function createRoomsStore({
       const first = room.players.keys().next().value;
       room.hostId = first;
     }
+    if (room.phase === "lobby" && room.players.size <= 2 && room.settings?.gameMode === "infection") {
+      room.settings.gameMode = "tag_swap";
+    }
   }
 
   function isSocketConnected(io, socketId) {
@@ -381,7 +735,7 @@ export function createRoomsStore({
     return !isSocketConnected(io, p.socketId);
   }
 
-  function countActivePrey(room, io) {
+  function countActivePlayers(room, io) {
     let n = 0;
     for (const p of room.players.values()) {
       if (p.role !== "player" || p.captured || p.spectator) continue;
@@ -603,6 +957,14 @@ export function createRoomsStore({
     if (partial.catAssignmentMode === "random" || partial.catAssignmentMode === "manual") {
       s.catAssignmentMode = partial.catAssignmentMode;
     }
+    if (partial.gameMode === "infection") {
+      if (room.players.size <= 2) {
+        return { error: "Le mode chats cumulés est disponible à partir de 3 joueurs." };
+      }
+      s.gameMode = partial.gameMode;
+    } else if (partial.gameMode === "tag_swap") {
+      s.gameMode = partial.gameMode;
+    }
     if (partial.hostCatMapPreview != null) {
       s.hostCatMapPreview = Boolean(partial.hostCatMapPreview);
     }
@@ -658,6 +1020,8 @@ export function createRoomsStore({
         p.originalRole = "player";
         p.captured = false;
         p.spectator = false;
+        p.catTimeMs = 0;
+        p.catSince = null;
         p.jamCircleCenter = null;
         p.jamAnchorLat = null;
         p.jamAnchorLng = null;
@@ -670,6 +1034,8 @@ export function createRoomsStore({
         p.originalRole = r;
         p.captured = false;
         p.spectator = false;
+        p.catTimeMs = 0;
+        p.catSince = r === "cat" ? Date.now() : null;
         p.jamCircleCenter = null;
         p.jamAnchorLat = null;
         p.jamAnchorLng = null;
@@ -692,6 +1058,9 @@ export function createRoomsStore({
     if (list.length < 2) {
       return { error: "Au moins 2 joueurs sont nécessaires." };
     }
+    if ((room.settings.gameMode || "tag_swap") === "infection" && list.length <= 2) {
+      return { error: "Le mode chats cumulés nécessite au moins 3 joueurs." };
+    }
     if ((room.settings.catAssignmentMode || "random") === "manual") {
       const { catCount } = room.settings;
       let cats = 0;
@@ -710,7 +1079,9 @@ export function createRoomsStore({
     room.jamHistory = [];
     room._lastJamSample = {};
     room.balises = [];
-    room.lastBaliseSpawnAt = Date.now();
+    room.initialPlayerCount = list.filter((p) => !p.spectator).length;
+    room.initialRemainingPlayerCount = list.filter((p) => p.role === "player" && !p.spectator).length;
+    room.lastBaliseSpawnAt = null;
     assignPlayerColors(room);
     pushTimeline(room, {
       type: "hunt_started",
@@ -723,16 +1094,23 @@ export function createRoomsStore({
 
   function finishGame(io, room, reason = "natural") {
     if (room.phase !== "playing") return;
+    const now = Date.now();
+    for (const p of room.players.values()) {
+      if (p.role === "cat" && p.catSince) {
+        p.catTimeMs = (p.catTimeMs || 0) + (now - p.catSince);
+        p.catSince = now;
+      }
+    }
     room.phase = "finished";
-    room.finishedAt = Date.now();
-    const msg =
-      reason === "admin"
-        ? "Partie terminée par l'hôte"
-        : reason === "time_limit"
-          ? "Limite de temps atteinte"
-          : reason === "no_prey_left"
-            ? "Plus aucune proie en jeu"
-            : "Partie terminée";
+    room.finishedAt = now;
+    const messages = {
+      admin: "Partie terminée par l'hôte",
+      time_limit: "Limite de temps atteinte",
+      all_cats: "Tous les joueurs sont devenus chats",
+      last_survivor: "Dernier survivant",
+      no_prey_left: "Plus aucun joueur en jeu",
+    };
+    const msg = messages[reason] || "Partie terminée";
     pushTimeline(room, {
       type: "game_over",
       reason,
@@ -752,8 +1130,16 @@ export function createRoomsStore({
   }
 
   function checkEndGame(io, room) {
-    // Game continues even with only 1 player - only ends on time limit or admin action
-    return;
+    if (room.phase !== "playing") return;
+    const active = [...room.players.values()].filter((p) => !p.spectator && !p.captured);
+    if (active.length > 0 && active.every((p) => p.role === "cat")) {
+      finishGame(io, room, "all_cats");
+      return;
+    }
+    const playersLeft = active.filter((p) => p.role === "player");
+    if ((room.settings.gameMode || "tag_swap") === "infection" && (room.initialRemainingPlayerCount || 0) > 1 && playersLeft.length === 1) {
+      finishGame(io, room, "last_survivor");
+    }
   }
 
   function buildRolesRevealPayload(room) {
@@ -785,6 +1171,20 @@ export function createRoomsStore({
     const lo = Number(lng);
     if (!Number.isFinite(la) || !Number.isFinite(lo)) return null;
     if (la < -90 || la > 90 || lo < -180 || lo > 180) return null;
+    
+    // Check out of bounds status changes
+    if (room.phase === "playing" && !p.spectator && !p.captured && room.gameCenter) {
+      const wasOutOfBounds = p.lat != null && p.lng != null ? !isInsideGameZone(p.lat, p.lng, room) : false;
+      const isNowOutOfBounds = !isInsideGameZone(la, lo, room);
+      
+      if (!wasOutOfBounds && isNowOutOfBounds) {
+        p.justWentOutOfBounds = true;
+      }
+      if (wasOutOfBounds && !isNowOutOfBounds) {
+        p.justReenteredZone = true;
+      }
+    }
+
     p.lat = la;
     p.lng = lo;
     return { room, player: p };
@@ -868,6 +1268,7 @@ export function createRoomsStore({
         timeLimitEnabled: room.settings.timeLimitEnabled,
         timeLimitMinutes: room.settings.timeLimitMinutes,
         catAssignmentMode: room.settings.catAssignmentMode || "random",
+        gameMode: room.settings.gameMode || "tag_swap",
         hostCatMapPreview: Boolean(room.settings.hostCatMapPreview),
       },
       gameCenter: center,
@@ -895,6 +1296,8 @@ export function createRoomsStore({
         captured: viewer.captured,
         spectator: viewer.spectator,
         coins: viewer.coins || 0,
+        catTimeMs: (viewer.catTimeMs || 0) + (viewer.role === "cat" && viewer.catSince ? Date.now() - viewer.catSince : 0),
+        outOfBounds: viewer.lat != null && viewer.lng != null ? !isInsideGameZone(viewer.lat, viewer.lng, room) : false,
       },
       myJamCircle: null,
       allies: [],
@@ -944,6 +1347,7 @@ export function createRoomsStore({
           lat: p.lat,
           lng: p.lng,
           disconnected: isDisconnectedGhost(p, io),
+          outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
         });
         continue;
       }
@@ -957,6 +1361,7 @@ export function createRoomsStore({
             lat: p.lat,
             lng: p.lng,
             disconnected: isDisconnectedGhost(p, io),
+            outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
           });
         } else if (p.role === "player") {
           if (p.lat == null || p.lng == null) continue;
@@ -970,6 +1375,7 @@ export function createRoomsStore({
               lat: p.lat,
               lng: p.lng,
               disconnected: disc,
+              outOfBounds: true,
             });
           } else if (p.jamCircleCenter) {
             payload.preyForCat.push({
@@ -1000,6 +1406,7 @@ export function createRoomsStore({
             lat: p.lat,
             lng: p.lng,
             disconnected: isDisconnectedGhost(p, io),
+            outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
           });
         }
       }
@@ -1025,6 +1432,7 @@ export function createRoomsStore({
             lat: p.lat,
             lng: p.lng,
             disconnected: disc,
+            outOfBounds: true,
           });
         } else if (p.jamCircleCenter) {
           prev.push({
@@ -1086,7 +1494,7 @@ export function createRoomsStore({
     }
     if (!prey) return { error: "Cible invalide ou déjà capturée." };
     if (prey.lat == null || prey.lng == null) {
-      return { error: "Position de la proie inconnue." };
+      return { error: "Position du joueur inconnue." };
     }
     
     // Transfer coins from prey to cat
@@ -1094,9 +1502,26 @@ export function createRoomsStore({
     prey.coins = 0;
     cat.coins = (cat.coins || 0) + preyCoins;
     
-    prey.captured = true;
-    prey.role = "cat";
-    prey.spectator = false;
+    const mode = room.settings.gameMode || "tag_swap";
+    if (mode === "tag_swap") {
+      const now = Date.now();
+      if (cat.catSince) {
+        cat.catTimeMs = (cat.catTimeMs || 0) + (now - cat.catSince);
+      }
+      cat.role = "player";
+      cat.captured = false;
+      cat.spectator = false;
+      cat.catSince = null;
+      prey.role = "cat";
+      prey.captured = false;
+      prey.spectator = false;
+      prey.catSince = now;
+    } else {
+      prey.captured = false;
+      prey.role = "cat";
+      prey.spectator = false;
+      prey.catSince = Date.now();
+    }
     pushTimeline(room, {
       type: "captured",
       sessionId: prey.sessionId,
@@ -1173,9 +1598,17 @@ export function createRoomsStore({
     }
     if (!target) return { error: "Joueur introuvable." };
     const prevRole = target.role;
+    const now = Date.now();
+    if (prevRole === "cat" && newRole !== "cat" && target.catSince) {
+      target.catTimeMs = (target.catTimeMs || 0) + (now - target.catSince);
+      target.catSince = null;
+    }
     target.role = newRole;
     target.captured = false;
     target.spectator = false;
+    if (newRole === "cat" && prevRole !== "cat") {
+      target.catSince = now;
+    }
     target.jamCircleCenter = null;
     target.jamAnchorLat = null;
     target.jamAnchorLng = null;
@@ -1260,12 +1693,12 @@ export function createRoomsStore({
     return { ok: true, requestId: pending.id };
   }
 
-  function respondJoinRequest(io, hostSocketId, requestId, accept) {
-    const code = socketToRoom.get(hostSocketId);
+  function respondJoinRequest(io, responderSocketId, requestId, accept) {
+    const code = socketToRoom.get(responderSocketId);
     if (!code) return { error: "Pas dans une salle." };
     const room = rooms.get(code);
-    if (!room || room.hostId !== hostSocketId) {
-      return { error: "Réservé à l'hôte." };
+    if (!room || !room.players.has(responderSocketId)) {
+      return { error: "Réservé aux membres de la partie." };
     }
     if (!room.pendingJoins?.length) return { error: "Aucune demande." };
     const idx = room.pendingJoins.findIndex((x) => x.id === requestId);
@@ -1276,7 +1709,7 @@ export function createRoomsStore({
     if (!accept) {
       reqSock?.emit("join_request_denied", {
         code: room.code,
-        message: "L'hôte a refusé votre demande.",
+        message: "Votre demande a été refusée.",
       });
       return { ok: true };
     }
@@ -1425,15 +1858,30 @@ export function createRoomsStore({
     if (sock) {
       sock.leave(code);
     }
+    socketToRoom.delete(socketId);
 
-    leaveRoom(socketId);
+    // If still in lobby, remove player entirely
+    if (room.phase === "lobby") {
+      room.players.delete(socketId);
+      // If host left, assign new host
+      if (room.hostId === socketId && room.players.size > 0) {
+        room.hostId = room.players.keys().next().value;
+      }
+    } else {
+      // If game started, just mark as disconnected
+      player.disconnectedAt = Date.now();
+    }
+
     io.to(code).emit("player_left", {
       nickname: player.nickname,
       sessionId: player.sessionId,
     });
 
     const r = rooms.get(code);
-    if (!r) return { ok: true };
+    if (!r || r.players.size === 0) {
+      if (r) nukeRoom(io, r, "empty");
+      return { ok: true };
+    }
 
     if (r.phase === "lobby") {
       io.to(code).emit("lobby_update", buildLobbyPayload(r, io));
@@ -1447,6 +1895,7 @@ export function createRoomsStore({
   }
 
   return {
+    rooms,
     socketToRoom,
     getRoomByCode,
     leaveRoom,
