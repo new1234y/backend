@@ -189,6 +189,116 @@ function syncJamCircles(room) {
   }
 }
 
+function spawnBalise(room) {
+  if (!room.gameCenter) return;
+  const effectiveRadius = getEffectiveGlobalRadius(room);
+  const baliseRadiusM = 30;
+  const position = randomOffsetPoint(
+    room.gameCenter.lat,
+    room.gameCenter.lng,
+    effectiveRadius - baliseRadiusM,
+    0.1,
+    0.9
+  );
+  
+  // Remove all existing balises (only one active at a time)
+  room.balises = [];
+  
+  const balise = {
+    id: uuidv4(),
+    lat: position.lat,
+    lng: position.lng,
+    radiusM: baliseRadiusM,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes lifetime
+    capturedBy: null,
+    captureProgress: 0,
+    beingCapturedBy: null,
+  };
+  room.balises.push(balise);
+  pushTimeline(room, {
+    type: "balise_spawned",
+    baliseId: balise.id,
+  });
+  return balise;
+}
+
+function updateBalises(room, io) {
+  if (room.phase !== "playing") return;
+  
+  const now = Date.now();
+  const baliseSpawnInterval = 5 * 60 * 1000; // 5 minutes
+  
+  // Spawn new balise every 5 minutes OR if no balise exists
+  if (!room.lastBaliseSpawnAt || now - room.lastBaliseSpawnAt >= baliseSpawnInterval || room.balises.length === 0) {
+    spawnBalise(room);
+    room.lastBaliseSpawnAt = now;
+  }
+  
+  // Update balise capture progress and check expiration
+  const captureTime = 30 * 1000; // 30 seconds
+  const toRemove = [];
+  
+  for (const balise of room.balises) {
+    // Remove expired balises
+    if (balise.expiresAt && now >= balise.expiresAt) {
+      toRemove.push(balise.id);
+      pushTimeline(room, {
+        type: "balise_expired",
+        baliseId: balise.id,
+      });
+      continue;
+    }
+    
+    if (balise.capturedBy) {
+      toRemove.push(balise.id);
+      continue;
+    }
+    
+    let currentPlayerInside = null;
+    
+    for (const p of room.players.values()) {
+      if (p.role !== "player" || p.captured || p.spectator) continue;
+      if (p.lat == null || p.lng == null) continue;
+      
+      const distance = haversineMeters(p.lat, p.lng, balise.lat, balise.lng);
+      if (distance <= balise.radiusM) {
+        currentPlayerInside = p;
+        break;
+      }
+    }
+    
+    if (currentPlayerInside) {
+      if (balise.beingCapturedBy === currentPlayerInside.sessionId) {
+        balise.captureProgress += 1000; // Add 1 second (called every second)
+      } else {
+        balise.beingCapturedBy = currentPlayerInside.sessionId;
+        balise.captureProgress = 1000;
+      }
+      
+      if (balise.captureProgress >= captureTime) {
+        balise.capturedBy = currentPlayerInside.sessionId;
+        currentPlayerInside.coins = (currentPlayerInside.coins || 0) + 10;
+        pushTimeline(room, {
+          type: "balise_captured",
+          baliseId: balise.id,
+          sessionId: currentPlayerInside.sessionId,
+          nickname: currentPlayerInside.nickname,
+        });
+        toRemove.push(balise.id);
+      }
+    } else {
+      balise.beingCapturedBy = null;
+      balise.captureProgress = 0;
+    }
+  }
+  
+  // Remove captured or expired balises
+  if (toRemove.length > 0) {
+    room.balises = room.balises.filter(b => !toRemove.includes(b.id));
+  }
+}
+
 function appendLocationSample(room, player) {
   if (room.phase !== "playing") return;
   if (player.lat == null || player.lng == null) return;
@@ -376,6 +486,7 @@ export function createRoomsStore({
       jamCircleCenter: null,
       jamAnchorLat: null,
       jamAnchorLng: null,
+      coins: 0,
     };
     const room = {
       code,
@@ -387,6 +498,8 @@ export function createRoomsStore({
       players: new Map([[socketId, player]]),
       pendingJoins: [],
       partyChat: [],
+      balises: [],
+      lastBaliseSpawnAt: null,
     };
     rooms.set(code, room);
     socketToRoom.set(socketId, code);
@@ -431,6 +544,7 @@ export function createRoomsStore({
       jamCircleCenter: null,
       jamAnchorLat: null,
       jamAnchorLng: null,
+      coins: 0,
     };
     room.players.set(socketId, player);
     socketToRoom.set(socketId, room.code);
@@ -595,6 +709,8 @@ export function createRoomsStore({
     room.traceBySession = {};
     room.jamHistory = [];
     room._lastJamSample = {};
+    room.balises = [];
+    room.lastBaliseSpawnAt = Date.now();
     assignPlayerColors(room);
     pushTimeline(room, {
       type: "hunt_started",
@@ -778,6 +894,7 @@ export function createRoomsStore({
         lng: viewer.lng,
         captured: viewer.captured,
         spectator: viewer.spectator,
+        coins: viewer.coins || 0,
       },
       myJamCircle: null,
       allies: [],
@@ -786,6 +903,8 @@ export function createRoomsStore({
       spectators: [],
       adminPreyPreview: null,
       partyChat: [...(room.partyChat || [])].slice(-80),
+      balises: room.balises || [],
+      nextBaliseAt: room.lastBaliseSpawnAt ? room.lastBaliseSpawnAt + 5 * 60 * 1000 : null,
     };
 
     if (catMapLocked) {
@@ -931,6 +1050,7 @@ export function createRoomsStore({
     purgeStaleDisconnects(io, room);
     if (!rooms.get(room.code)) return;
     syncJamCircles(room);
+    updateBalises(room, io);
     for (const socketId of room.players.keys()) {
       const sock = io.sockets.sockets.get(socketId);
       if (!sock) continue;
@@ -968,19 +1088,28 @@ export function createRoomsStore({
     if (prey.lat == null || prey.lng == null) {
       return { error: "Position de la proie inconnue." };
     }
+    
+    // Transfer coins from prey to cat
+    const preyCoins = prey.coins || 0;
+    prey.coins = 0;
+    cat.coins = (cat.coins || 0) + preyCoins;
+    
     prey.captured = true;
-    prey.spectator = true;
+    prey.role = "cat";
+    prey.spectator = false;
     pushTimeline(room, {
       type: "captured",
       sessionId: prey.sessionId,
       nickname: prey.nickname,
       bySessionId: cat.sessionId,
       byNickname: cat.nickname,
+      coinsTransferred: preyCoins,
     });
     broadcastPlayingState(io, room);
     io.to(code).emit("capture_ok", {
       preySessionId: prey.sessionId,
       preyNickname: prey.nickname,
+      coinsTransferred: preyCoins,
     });
     return { ok: true };
   }
@@ -1043,9 +1172,6 @@ export function createRoomsStore({
       }
     }
     if (!target) return { error: "Joueur introuvable." };
-    if (target.socketId === hostSocketId) {
-      return { error: "Impossible de changer votre propre rôle." };
-    }
     const prevRole = target.role;
     target.role = newRole;
     target.captured = false;
@@ -1172,6 +1298,7 @@ export function createRoomsStore({
       jamCircleCenter: null,
       jamAnchorLat: null,
       jamAnchorLng: null,
+      coins: 0,
     };
     room.players.set(pending.socketId, player);
     socketToRoom.set(pending.socketId, room.code);
@@ -1347,5 +1474,6 @@ export function createRoomsStore({
     recordPlayerTimelineDisconnect,
     recordPlayerTimelineReconnect,
     partyChatSend,
+    updateBalises,
   };
 }

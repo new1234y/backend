@@ -74,6 +74,16 @@ const store = createRoomsStore({
   onRoomNuked: () => {},
 });
 
+// Update balises every second
+setInterval(() => {
+  for (const [code, room] of store.rooms || []) {
+    if (room.phase === "playing") {
+      store.updateBalises(room, io);
+      store.broadcastPlayingState(io, room);
+    }
+  }
+}, 1000);
+
 // Map sessionId -> { socketId, roomCode, nickname, ... } pour la reconnexion
 const sessionRegistry = new Map();
 
