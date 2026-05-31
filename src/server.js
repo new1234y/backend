@@ -5,11 +5,20 @@ import cors from "cors";
 import { Server } from "socket.io";
 import { createRoomsStore } from "./rooms.js";
 import { corsOriginOption } from "./corsConfig.js";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 
 const PORT = Number(process.env.PORT) || 3001;
 const HOST = process.env.HOST || "0.0.0.0";
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 const corsOrigin = corsOriginOption(CLIENT_ORIGIN);
+
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.SUPABASE_URL_PUBLIC || "";
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.API ||
+  "";
+const supabase = SUPABASE_URL && SUPABASE_KEY ? createSupabaseClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
 const app = express();
 app.use(cors({ origin: corsOrigin, credentials: true }));
@@ -31,19 +40,24 @@ function randomRecapId(len = 8) {
   return s;
 }
 
-app.post("/api/recap", (req, res) => {
+app.post("/api/recap", async (req, res) => {
   try {
     const body = req.body;
     if (!body || typeof body !== "object") {
       return res.status(400).json({ error: "invalid_body" });
     }
     let id = randomRecapId(8);
+    if (supabase) {
+      const { error } = await supabase.from("game_recaps").insert({ id, summary: body });
+      if (!error) {
+        return res.json({ id });
+      }
+      console.error("supabase_insert_error", error?.message || error);
+    }
     while (recapStore.has(id)) id = randomRecapId(8);
     recapStore.set(id, { at: Date.now(), summary: body });
     while (recapStore.size > MAX_RECAPS) {
-      const oldest = [...recapStore.entries()].sort(
-        (a, b) => a[1].at - b[1].at
-      )[0];
+      const oldest = [...recapStore.entries()].sort((a, b) => a[1].at - b[1].at)[0];
       recapStore.delete(oldest[0]);
     }
     return res.json({ id });
@@ -53,8 +67,20 @@ app.post("/api/recap", (req, res) => {
   }
 });
 
-app.get("/api/recap/:id", (req, res) => {
+app.get("/api/recap/:id", async (req, res) => {
   const id = String(req.params.id || "").toUpperCase();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("game_recaps")
+      .select("summary")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) {
+      console.error("supabase_select_error", error?.message || error);
+    } else if (data && data.summary) {
+      return res.json(data.summary);
+    }
+  }
   const row = recapStore.get(id);
   if (!row?.summary) return res.status(404).json({ error: "not_found" });
   return res.json(row.summary);
