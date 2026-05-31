@@ -28,18 +28,15 @@ const COLOR_PALETTE = [
 ];
 
 function randomCode(len = 5) {
-  console.log('[randomCode] Called with:', { len });
   let s = "";
   for (let i = 0; i < len; i++) {
     s += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
   }
-  console.log('[randomCode] Result:', s);
   return s;
 }
 
 
 const defaultSettings = () => {
-  console.log('[defaultSettings] Called');
   const settings = {
   globalRadiusM: 500,
   jamRadiusM: 80,
@@ -60,13 +57,11 @@ const defaultSettings = () => {
   /** Réservé à l'hôte : aperçu carte avec les mêmes cercles que les chats */
   hostCatMapPreview: false,
   };
-  console.log('[defaultSettings] Result:', settings);
   return settings;
 };
 
 /** Paliers de rayon + métadonnées pour l'UI (phase suivante, fin de palier). */
 function getShrinkState(room) {
-  console.log('[getShrinkState] Called with room code:', room?.code);
   const R0 = Number(room.settings.globalRadiusM) || 500;
   if (
     !room.settings.shrinkZoneEnabled ||
@@ -79,7 +74,6 @@ function getShrinkState(room) {
       currentPhase: 1,
       totalPhases: 1,
     };
-    console.log('[getShrinkState] Shrink disabled, returning:', result);
     return result;
   }
   const durMin = Math.max(1, Number(room.settings.shrinkDurationMinutes) || 15);
@@ -109,42 +103,33 @@ function getShrinkState(room) {
     currentPhase: idx + 1,
     totalPhases: phases,
   };
-  console.log('[getShrinkState] Result:', result);
   return result;
 }
 
 function getEffectiveGlobalRadius(room) {
-  console.log('[getEffectiveGlobalRadius] Called with room code:', room?.code);
   const result = getShrinkState(room).currentRadius;
-  console.log('[getEffectiveGlobalRadius] Result:', result);
   return result;
 }
 
 function isInsideGameZone(lat, lng, room) {
-  console.log('[isInsideGameZone] Called with:', { lat, lng, roomCode: room?.code });
   const gc = room.gameCenter;
   const r = getEffectiveGlobalRadius(room);
   const result = isInsideRadius(lat, lng, gc, r);
-  console.log('[isInsideGameZone] Result:', result);
   return result;
 }
 
 function pushTimeline(room, evt) {
-  console.log('[pushTimeline] Called with:', { roomCode: room?.code, evt });
   if (!room.timelineEvents) room.timelineEvents = [];
   room.timelineEvents.push({ t: Date.now(), ...evt });
-  console.log('[pushTimeline] Timeline events count:', room.timelineEvents.length);
 }
 
 function assignPlayerColors(room) {
-  console.log('[assignPlayerColors] Called with room code:', room?.code, 'players:', room?.players?.size);
   room.playerColors = {};
   let i = 0;
   for (const p of room.players.values()) {
     room.playerColors[p.sessionId] = COLOR_PALETTE[i % COLOR_PALETTE.length];
     i++;
   }
-  console.log('[assignPlayerColors] Assigned colors to', i, 'players');
 }
 
 /** Recalcule le cercle de brouillage : fixe tant que la position réelle reste dans le disque. */
@@ -757,40 +742,31 @@ export function createRoomsStore({
   const emptyRoomTimers = new Map();
 
   function getRoomByCode(code) {
-    console.log('[getRoomByCode] Called with:', { code });
     const result = rooms.get(code?.toUpperCase());
-    console.log('[getRoomByCode] Result:', result ? 'Found' : 'Not found');
     return result;
   }
 
   function leaveRoom(socketId) {
-    console.log('[leaveRoom] Called with:', { socketId });
     const code = socketToRoom.get(socketId);
     if (!code) {
-      console.log('[leaveRoom] No code found for socketId');
       return;
     }
     const room = rooms.get(code);
     if (!room) {
       socketToRoom.delete(socketId);
-      console.log('[leaveRoom] Room not found, deleted socketId mapping');
       return;
     }
     room.players.delete(socketId);
     socketToRoom.delete(socketId);
-    console.log('[leaveRoom] Player removed, remaining players:', room.players.size);
     if (room.players.size === 0) {
       clearRoomAbandonTimer(code);
       rooms.delete(code);
-      console.log('[leaveRoom] Room deleted (empty)');
     } else if (room.hostId === socketId) {
       const first = room.players.keys().next().value;
       room.hostId = first;
-      console.log('[leaveRoom] Host changed to:', first);
     }
     if (room.phase === "lobby" && room.players.size <= 2 && room.settings?.gameMode === "infection") {
       room.settings.gameMode = "tag_swap";
-      console.log('[leaveRoom] Game mode switched to tag_swap');
     }
   }
 
@@ -889,7 +865,6 @@ export function createRoomsStore({
   }
 
   function createRoom(socketId, nickname) {
-    console.log('[createRoom] Called with:', { socketId, nickname });
     leaveRoom(socketId);
     let code;
     do {
@@ -927,27 +902,23 @@ export function createRoomsStore({
     };
     rooms.set(code, room);
     socketToRoom.set(socketId, code);
-    console.log('[createRoom] Room created:', { code, sessionId, nickname });
+    console.log(`Salle ${code} créée par ${player.nickname}`);
     return { room, player };
   }
 
   function joinRoom(socketId, code, nickname, existingSessionId = null) {
-    console.log('[joinRoom] Called with:', { socketId, code, nickname, existingSessionId });
     leaveRoom(socketId);
     const room = rooms.get(String(code || "").toUpperCase());
     if (!room) {
-      console.log('[joinRoom] Room not found');
       return { error: "Salle introuvable." };
     }
     if (room.phase !== "lobby") {
-      console.log('[joinRoom] Room not in lobby, phase:', room.phase);
       if (room.phase === "finished") {
         return { error: "Cette partie est terminée." };
       }
 
       // Check if we are trying to rejoin an existing session
       if (existingSessionId) {
-        console.log('[joinRoom] Attempting rejoin with sessionId:', existingSessionId);
         let foundPlayer = null;
         for (const p of room.players.values()) {
           if (p.sessionId === existingSessionId) {
@@ -968,7 +939,7 @@ export function createRoomsStore({
           if (room.hostId === oldSocketId) {
             room.hostId = socketId;
           }
-          console.log('[joinRoom] Rejoin successful for:', foundPlayer.nickname);
+          console.log(`Reconnexion dans ${room.code} · ${foundPlayer.nickname}`);
           return { room, player: foundPlayer, isRejoin: true };
         }
       }
@@ -983,7 +954,6 @@ export function createRoomsStore({
     const normalizedNickname = String(nickname || "Joueur").slice(0, 24).toLowerCase();
     for (const player of room.players.values()) {
       if (player.nickname.toLowerCase() === normalizedNickname) {
-        console.log('[joinRoom] Duplicate nickname:', normalizedNickname);
         return { error: "Ce pseudo est déjà utilisé dans cette partie." };
       }
     }
@@ -1006,7 +976,7 @@ export function createRoomsStore({
     };
     room.players.set(socketId, player);
     socketToRoom.set(socketId, room.code);
-    console.log('[joinRoom] Joined room:', { code, sessionId, nickname });
+    console.log(`Rejoint salle ${room.code} · ${player.nickname}`);
     return { room, player };
   }
 
@@ -1092,34 +1062,27 @@ export function createRoomsStore({
   }
 
   function startRoles(socketId) {
-    console.log('[startRoles] Called with:', { socketId });
     const code = socketToRoom.get(socketId);
     if (!code) {
-      console.log('[startRoles] No code found');
       return { error: "Pas dans une salle." };
     }
     const room = rooms.get(code);
     if (!room || room.hostId !== socketId) {
-      console.log('[startRoles] Not host or room not found');
       return { error: "Seul l'hôte peut lancer la révélation." };
     }
     if (room.phase !== "lobby") {
-      console.log('[startRoles] Not in lobby phase:', room.phase);
       return { error: "Les rôles sont déjà attribués." };
     }
     const list = [...room.players.values()];
     if (list.length < 2) {
-      console.log('[startRoles] Not enough players:', list.length);
       return { error: "Au moins 2 joueurs sont nécessaires pour lancer." };
     }
     const { catCount } = room.settings;
     if (catCount >= list.length) {
-      console.log('[startRoles] Too many cats:', catCount, 'players:', list.length);
       return { error: "Le nombre de chats doit être inférieur au nombre de joueurs." };
     }
     const center = computeGameCenter(room);
     if (!center) {
-      console.log('[startRoles] No game center');
       return {
         error:
           "Position GPS indisponible pour le centre de la zone. Activez le GPS.",
@@ -1128,9 +1091,7 @@ export function createRoomsStore({
     room.gameCenter = center;
     room.phase = "role_reveal";
     room.catMapUnlockAt = null;
-    console.log('[startRoles] Game center set:', center);
     if ((room.settings.catAssignmentMode || "random") === "manual") {
-      console.log('[startRoles] Manual assignment mode');
       list.forEach((p) => {
         p.role = "player";
         p.originalRole = "player";
@@ -1143,7 +1104,6 @@ export function createRoomsStore({
         p.jamAnchorLng = null;
       });
     } else {
-      console.log('[startRoles] Random assignment mode, catCount:', catCount);
       const shuffled = [...list].sort(() => Math.random() - 0.5);
       shuffled.forEach((p, i) => {
         const r = i < catCount ? "cat" : "player";
@@ -1156,36 +1116,29 @@ export function createRoomsStore({
         p.jamCircleCenter = null;
         p.jamAnchorLat = null;
         p.jamAnchorLng = null;
-        console.log('[startRoles] Assigned role', r, 'to', p.nickname);
       });
     }
-    console.log('[startRoles] Roles started successfully');
+    console.log(`Rôles révélés pour la salle ${room.code}`);
     return { ok: true, room };
   }
 
   function beginHunt(socketId) {
-    console.log('[beginHunt] Called with:', { socketId });
     const code = socketToRoom.get(socketId);
     if (!code) {
-      console.log('[beginHunt] No code found');
       return { error: "Pas dans une salle." };
     }
     const room = rooms.get(code);
     if (!room || room.hostId !== socketId) {
-      console.log('[beginHunt] Not host or room not found');
       return { error: "Seul l'hôte peut démarrer la chasse." };
     }
     if (room.phase !== "role_reveal") {
-      console.log('[beginHunt] Not in role_reveal phase:', room.phase);
       return { error: "Révélez d'abord les rôles." };
     }
     const list = [...room.players.values()];
     if (list.length < 2) {
-      console.log('[beginHunt] Not enough players:', list.length);
       return { error: "Au moins 2 joueurs sont nécessaires." };
     }
     if ((room.settings.gameMode || "tag_swap") === "infection" && list.length <= 2) {
-      console.log('[beginHunt] Infection mode needs 3+ players');
       return { error: "Le mode chats cumulés nécessite au moins 3 joueurs." };
     }
     if ((room.settings.catAssignmentMode || "random") === "manual") {
@@ -1195,7 +1148,6 @@ export function createRoomsStore({
         if (p.role === "cat" && !p.spectator) cats++;
       }
       if (cats !== catCount) {
-        console.log('[beginHunt] Wrong cat count:', cats, 'expected:', catCount);
         return {
           error: `En mode manuel, choisissez exactement ${catCount} chat(s). Actuellement : ${cats}.`,
         };
@@ -1217,7 +1169,7 @@ export function createRoomsStore({
     });
     const delayMs = Math.max(0, Number(room.settings.catDelayMinutes) || 0) * 60 * 1000;
     room.catMapUnlockAt = Date.now() + delayMs;
-    console.log('[beginHunt] Hunt started, cat map unlock at:', new Date(room.catMapUnlockAt));
+    console.log(`Chasse démarrée (${room.code}) · carte chats vers ${new Date(room.catMapUnlockAt).toLocaleTimeString()}`);
     return { ok: true, room };
   }
 
@@ -1289,34 +1241,27 @@ export function createRoomsStore({
   }
 
   function setPosition(socketId, lat, lng) {
-  console.log('[setPosition] Called with:', { socketId, lat, lng });
   const code = socketToRoom.get(socketId);
   if (!code) {
-    console.log('[setPosition] No code found for socketId');
     return null;
   }
   const room = rooms.get(code);
   if (!room) {
-    console.log('[setPosition] Room not found');
     return null;
   }
   if (room.phase === "finished") {
-    console.log('[setPosition] Room finished');
     return null;
   }
   const p = room.players.get(socketId);
   if (!p) {
-    console.log('[setPosition] Player not found');
     return null;
   }
   const la = Number(lat);
   const lo = Number(lng);
   if (!Number.isFinite(la) || !Number.isFinite(lo)) {
-    console.log('[setPosition] Invalid coordinates');
     return null;
   }
   if (la < -90 || la > 90 || lo < -180 || lo > 180) {
-    console.log('[setPosition] Coordinates out of range');
     return null;
   }
   
@@ -1327,17 +1272,14 @@ export function createRoomsStore({
     
     if (!wasOutOfBounds && isNowOutOfBounds) {
       p.justWentOutOfBounds = true;
-      console.log('[setPosition] Player went out of bounds:', p.nickname);
     }
     if (wasOutOfBounds && !isNowOutOfBounds) {
       p.justReenteredZone = true;
-      console.log('[setPosition] Player reentered zone:', p.nickname);
     }
   }
 
   p.lat = la;
   p.lng = lo;
-  console.log('[setPosition] Position updated for:', p.nickname);
   return { room, player: p };
   }
 
@@ -1663,15 +1605,25 @@ export function createRoomsStore({
       cat.captured = false;
       cat.spectator = false;
       cat.catSince = null;
+      cat.jamCircleCenter = null;
+      cat.jamAnchorLat = null;
+      cat.jamAnchorLng = null;
+      
       prey.role = "cat";
       prey.captured = false;
       prey.spectator = false;
       prey.catSince = now;
+      prey.jamCircleCenter = null;
+      prey.jamAnchorLat = null;
+      prey.jamAnchorLng = null;
     } else {
       prey.captured = false;
       prey.role = "cat";
       prey.spectator = false;
       prey.catSince = Date.now();
+      prey.jamCircleCenter = null;
+      prey.jamAnchorLat = null;
+      prey.jamAnchorLng = null;
     }
     pushTimeline(room, {
       type: "captured",
