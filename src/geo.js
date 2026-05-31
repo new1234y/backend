@@ -2,6 +2,7 @@ const EARTH_R = 6371000;
 
 /** Déplace (lat,lng) d'une distance fixe (m) selon un relèvement en degrés (0 = nord). */
 export function offsetMeters(lat, lng, bearingDeg, distM) {
+  console.log('[offsetMeters] Called with:', { lat, lng, bearingDeg, distM });
   const br = (bearingDeg * Math.PI) / 180;
   const dR = distM / EARTH_R;
   const lat1 = (lat * Math.PI) / 180;
@@ -16,10 +17,13 @@ export function offsetMeters(lat, lng, bearingDeg, distM) {
       Math.sin(br) * Math.sin(dR) * Math.cos(lat1),
       Math.cos(dR) - Math.sin(lat1) * Math.sin(lat2)
     );
-  return { lat: (lat2 * 180) / Math.PI, lng: (lon2 * 180) / Math.PI };
+  const result = { lat: (lat2 * 180) / Math.PI, lng: (lon2 * 180) / Math.PI };
+  console.log('[offsetMeters] Result:', result);
+  return result;
 }
 
 export function haversineMeters(lat1, lon1, lat2, lon2) {
+  console.log('[haversineMeters] Called with:', { lat1, lon1, lat2, lon2 });
   const toRad = (d) => (d * Math.PI) / 180;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
@@ -27,7 +31,9 @@ export function haversineMeters(lat1, lon1, lat2, lon2) {
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return EARTH_R * c;
+  const result = EARTH_R * c;
+  console.log('[haversineMeters] Result:', result);
+  return result;
 }
 
 /**
@@ -35,6 +41,7 @@ export function haversineMeters(lat1, lon1, lat2, lon2) {
  * depuis (lat, lon), angle uniforme.
  */
 export function randomOffsetPoint(lat, lon, radiusMeters, minFrac = 0.3, maxFrac = 0.7) {
+  console.log('[randomOffsetPoint] Called with:', { lat, lon, radiusMeters, minFrac, maxFrac });
   const dist =
     radiusMeters * (minFrac + Math.random() * (maxFrac - minFrac));
   const bearing = Math.random() * 2 * Math.PI;
@@ -51,19 +58,31 @@ export function randomOffsetPoint(lat, lon, radiusMeters, minFrac = 0.3, maxFrac
       Math.sin(bearing) * Math.sin(dR) * Math.cos(lat1),
       Math.cos(dR) - Math.sin(lat1) * Math.sin(lat2)
     );
-  return { lat: (lat2 * 180) / Math.PI, lng: (lon2 * 180) / Math.PI };
+  const result = { lat: (lat2 * 180) / Math.PI, lng: (lon2 * 180) / Math.PI };
+  console.log('[randomOffsetPoint] Result:', result);
+  return result;
 }
 
 export function isInsideRadius(lat, lon, center, radiusM) {
-  if (!center || radiusM == null) return true;
-  return haversineMeters(lat, lon, center.lat, center.lng) <= radiusM;
+  console.log('[isInsideRadius] Called with:', { lat, lon, center, radiusM });
+  if (!center || radiusM == null) {
+    console.log('[isInsideRadius] No center or radius, returning true');
+    return true;
+  }
+  const result = haversineMeters(lat, lon, center.lat, center.lng) <= radiusM;
+  console.log('[isInsideRadius] Result:', result);
+  return result;
 }
 
 /**
  * Anneau fermé [[lat,lng], ...] — point dans polygone (rayon horizontal vers l'est).
  */
 export function pointInRing(lat, lon, ring) {
-  if (!ring || ring.length < 3) return false;
+  console.log('[pointInRing] Called with:', { lat, lon, ringLength: ring?.length });
+  if (!ring || ring.length < 3) {
+    console.log('[pointInRing] Invalid ring, returning false');
+    return false;
+  }
   let inside = false;
   for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
     const latI = ring[i][0];
@@ -76,14 +95,23 @@ export function pointInRing(lat, lon, ring) {
       if (lon < xInt) inside = !inside;
     }
   }
+  console.log('[pointInRing] Result:', inside);
   return inside;
 }
 
 /** Plusieurs anneaux (union) : vrai si dans au moins un. */
 export function isInsideAnyPolygon(lat, lon, rings) {
-  if (!rings?.length) return true;
-  for (const ring of rings) {
-    if (pointInRing(lat, lon, ring)) return true;
+  console.log('[isInsideAnyPolygon] Called with:', { lat, lon, ringsCount: rings?.length });
+  if (!rings?.length) {
+    console.log('[isInsideAnyPolygon] No rings, returning true');
+    return true;
   }
+  for (const ring of rings) {
+    if (pointInRing(lat, lon, ring)) {
+      console.log('[isInsideAnyPolygon] Point inside a ring, returning true');
+      return true;
+    }
+  }
+  console.log('[isInsideAnyPolygon] Point not inside any ring, returning false');
   return false;
 }

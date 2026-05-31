@@ -28,15 +28,19 @@ const COLOR_PALETTE = [
 ];
 
 function randomCode(len = 5) {
+  console.log('[randomCode] Called with:', { len });
   let s = "";
   for (let i = 0; i < len; i++) {
     s += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
   }
+  console.log('[randomCode] Result:', s);
   return s;
 }
 
 
-const defaultSettings = () => ({
+const defaultSettings = () => {
+  console.log('[defaultSettings] Called');
+  const settings = {
   globalRadiusM: 500,
   jamRadiusM: 80,
   catCount: 1,
@@ -55,22 +59,28 @@ const defaultSettings = () => ({
   gameMode: "tag_swap",
   /** Réservé à l'hôte : aperçu carte avec les mêmes cercles que les chats */
   hostCatMapPreview: false,
-});
+  };
+  console.log('[defaultSettings] Result:', settings);
+  return settings;
+};
 
-/** Paliers de rayon + métadonnées pour l’UI (phase suivante, fin de palier). */
+/** Paliers de rayon + métadonnées pour l'UI (phase suivante, fin de palier). */
 function getShrinkState(room) {
+  console.log('[getShrinkState] Called with room code:', room?.code);
   const R0 = Number(room.settings.globalRadiusM) || 500;
   if (
     !room.settings.shrinkZoneEnabled ||
     !room.huntStartedAt
   ) {
-    return {
+    const result = {
       currentRadius: R0,
       nextRadius: null,
       phaseEndsAt: null,
       currentPhase: 1,
       totalPhases: 1,
     };
+    console.log('[getShrinkState] Shrink disabled, returning:', result);
+    return result;
   }
   const durMin = Math.max(1, Number(room.settings.shrinkDurationMinutes) || 15);
   const Rmin = Math.min(
@@ -92,37 +102,49 @@ function getShrinkState(room) {
   const currentRadius = radii[idx];
   const nextRadius = idx < phases - 1 ? radii[idx + 1] : null;
   const phaseEndsAt = room.huntStartedAt + (idx + 1) * segMs;
-  return {
+  const result = {
     currentRadius,
     nextRadius,
     phaseEndsAt,
     currentPhase: idx + 1,
     totalPhases: phases,
   };
+  console.log('[getShrinkState] Result:', result);
+  return result;
 }
 
 function getEffectiveGlobalRadius(room) {
-  return getShrinkState(room).currentRadius;
+  console.log('[getEffectiveGlobalRadius] Called with room code:', room?.code);
+  const result = getShrinkState(room).currentRadius;
+  console.log('[getEffectiveGlobalRadius] Result:', result);
+  return result;
 }
 
 function isInsideGameZone(lat, lng, room) {
+  console.log('[isInsideGameZone] Called with:', { lat, lng, roomCode: room?.code });
   const gc = room.gameCenter;
   const r = getEffectiveGlobalRadius(room);
-  return isInsideRadius(lat, lng, gc, r);
+  const result = isInsideRadius(lat, lng, gc, r);
+  console.log('[isInsideGameZone] Result:', result);
+  return result;
 }
 
 function pushTimeline(room, evt) {
+  console.log('[pushTimeline] Called with:', { roomCode: room?.code, evt });
   if (!room.timelineEvents) room.timelineEvents = [];
   room.timelineEvents.push({ t: Date.now(), ...evt });
+  console.log('[pushTimeline] Timeline events count:', room.timelineEvents.length);
 }
 
 function assignPlayerColors(room) {
+  console.log('[assignPlayerColors] Called with room code:', room?.code, 'players:', room?.players?.size);
   room.playerColors = {};
   let i = 0;
   for (const p of room.players.values()) {
     room.playerColors[p.sessionId] = COLOR_PALETTE[i % COLOR_PALETTE.length];
     i++;
   }
+  console.log('[assignPlayerColors] Assigned colors to', i, 'players');
 }
 
 /** Recalcule le cercle de brouillage : fixe tant que la position réelle reste dans le disque. */
@@ -246,13 +268,28 @@ async function fetchOsmBaliseCandidates(center, radiusM) {
   if (cached && Date.now() - cached.at < OSM_BALISE_CACHE_TTL_MS) return cached.data;
   const query = `[out:json][timeout:8];
 (
-  way(around:${radius},${center.lat},${center.lng})["highway"~"^(footway|path|pedestrian|steps|track|cycleway|bridleway)$"]["access"!~"^(private|no)$"];
-  way(around:${radius},${center.lat},${center.lng})["highway"~"^(residential|service|living_street)$"]["sidewalk"~"^(both|left|right|yes|separate)$"]["access"!~"^(private|no)$"];
-  way(around:${radius},${center.lat},${center.lng})["foot"~"^(yes|designated|permissive)$"]["access"!~"^(private|no)$"];
+  // Voies 100% piétonnes
+  way(around:${radius},${center.lat},${center.lng})["highway"~"^(footway|path|pedestrian|steps|corridor)$"]["access"!~"^(private|no)$"];
+
+  // Trottoirs présents sur une voie
+  way(around:${radius},${center.lat},${center.lng})["sidewalk"~"^(both|left|right|yes|separate)$"]["access"!~"^(private|no)$"];
+
+  // Passages piétons (ways et nodes)
+  way(around:${radius},${center.lat},${center.lng})["highway"="crossing"]["access"!~"^(private|no)$"];
+  way(around:${radius},${center.lat},${center.lng})["footway"="crossing"]["access"!~"^(private|no)$"];
+  node(around:${radius},${center.lat},${center.lng})["highway"="crossing"]["access"!~"^(private|no)$"];
+
+  // Espaces publics ouverts (hors terrains en asphalte)
+  way(around:${radius},${center.lat},${center.lng})["leisure"~"^(stadium|park|playground|sports_centre)$"]["access"!~"^(private|no)$"];
+  way(around:${radius},${center.lat},${center.lng})["leisure"="pitch"]["surface"!~"^asphalt$"]["access"!~"^(private|no)$"];
+  way(around:${radius},${center.lat},${center.lng})["landuse"~"^(grass|meadow|recreation_ground|village_green)$"]["access"!~"^(private|no)$"];
+
+  // Zones à éviter (bloquantes)
+  way(around:${radius},${center.lat},${center.lng})["amenity"~"^(school|university|college)$"];
   way(around:${radius},${center.lat},${center.lng})["landuse"="residential"];
   way(around:${radius},${center.lat},${center.lng})["building"];
 );
-out geom;`;
+out center geom;`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 9000);
   try {
@@ -265,9 +302,19 @@ out geom;`;
     if (!res.ok) throw new Error(`Overpass ${res.status}`);
     const json = await res.json();
     const elements = Array.isArray(json.elements) ? json.elements : [];
-    const walkways = elements.filter((x) => x.type === "way" && x.tags?.highway && x.geometry?.length);
-    const blockedAreas = elements.filter((x) => x.type === "way" && (x.tags?.landuse === "residential" || x.tags?.building) && x.geometry?.length >= 3);
-    const data = { walkways, blockedAreas };
+    const isAccessibleWay = (x) => x.type === "way" && x.geometry?.length && (
+      (x.tags?.highway && /^(footway|path|pedestrian|steps|corridor|crossing)$/.test(x.tags.highway)) ||
+      (x.tags?.footway === "crossing") ||
+      (typeof x.tags?.sidewalk === "string" && /^(both|left|right|yes|separate)$/.test(x.tags.sidewalk)) ||
+      (x.tags?.leisure && (/^(stadium|park|playground|sports_centre|pitch)$/.test(x.tags.leisure)) && (x.tags.leisure !== "pitch" || x.tags.surface !== "asphalt")) ||
+      (x.tags?.landuse && /^(grass|meadow|recreation_ground|village_green)$/.test(x.tags.landuse))
+    );
+    const crossingNodes = elements.filter((x) => x.type === "node" && x.tags?.highway === "crossing" && Number.isFinite(x.lat) && Number.isFinite(x.lon));
+    const walkways = elements.filter(isAccessibleWay);
+    const blockedAreas = elements.filter((x) => x.type === "way" && (
+      x.tags?.landuse === "residential" || x.tags?.building || /^(school|university|college)$/.test(x.tags?.amenity || "")
+    ) && x.geometry?.length >= 3);
+    const data = { walkways, crossingNodes, blockedAreas };
     osmBaliseCache.set(key, { at: Date.now(), data });
     return data;
   } finally {
@@ -277,14 +324,24 @@ out geom;`;
 
 async function pickOsmBalisePosition(room, effectiveRadius, baliseRadiusM) {
   try {
-    const { walkways, blockedAreas } = await fetchOsmBaliseCandidates(room.gameCenter, effectiveRadius);
-    const shuffled = [...walkways].sort(() => Math.random() - 0.5);
-    for (const way of shuffled) {
+    const { walkways, crossingNodes, blockedAreas } = await fetchOsmBaliseCandidates(room.gameCenter, effectiveRadius);
+
+    // Build a mixed pool of candidates: points from ways (random geometry nodes) and crossing nodes directly
+    const wayPool = [...walkways].sort(() => Math.random() - 0.5);
+    for (const way of wayPool) {
       for (let i = 0; i < 8; i++) {
         const candidate = pickPointOnWayGeometry(way.geometry);
         if (candidate && isOsmCandidateSafe(candidate, blockedAreas, room, effectiveRadius, baliseRadiusM)) {
           return { ...candidate, source: "osm", osmWayId: way.id };
         }
+      }
+    }
+
+    const nodePool = [...crossingNodes].sort(() => Math.random() - 0.5);
+    for (const node of nodePool) {
+      const candidate = { lat: Number(node.lat), lng: Number(node.lon) };
+      if (isOsmCandidateSafe(candidate, blockedAreas, room, effectiveRadius, baliseRadiusM)) {
+        return { ...candidate, source: "osm", osmNodeId: node.id };
       }
     }
   } catch (e) {
@@ -700,28 +757,40 @@ export function createRoomsStore({
   const emptyRoomTimers = new Map();
 
   function getRoomByCode(code) {
-    return rooms.get(code?.toUpperCase());
+    console.log('[getRoomByCode] Called with:', { code });
+    const result = rooms.get(code?.toUpperCase());
+    console.log('[getRoomByCode] Result:', result ? 'Found' : 'Not found');
+    return result;
   }
 
   function leaveRoom(socketId) {
+    console.log('[leaveRoom] Called with:', { socketId });
     const code = socketToRoom.get(socketId);
-    if (!code) return;
+    if (!code) {
+      console.log('[leaveRoom] No code found for socketId');
+      return;
+    }
     const room = rooms.get(code);
     if (!room) {
       socketToRoom.delete(socketId);
+      console.log('[leaveRoom] Room not found, deleted socketId mapping');
       return;
     }
     room.players.delete(socketId);
     socketToRoom.delete(socketId);
+    console.log('[leaveRoom] Player removed, remaining players:', room.players.size);
     if (room.players.size === 0) {
       clearRoomAbandonTimer(code);
       rooms.delete(code);
+      console.log('[leaveRoom] Room deleted (empty)');
     } else if (room.hostId === socketId) {
       const first = room.players.keys().next().value;
       room.hostId = first;
+      console.log('[leaveRoom] Host changed to:', first);
     }
     if (room.phase === "lobby" && room.players.size <= 2 && room.settings?.gameMode === "infection") {
       room.settings.gameMode = "tag_swap";
+      console.log('[leaveRoom] Game mode switched to tag_swap');
     }
   }
 
@@ -820,6 +889,7 @@ export function createRoomsStore({
   }
 
   function createRoom(socketId, nickname) {
+    console.log('[createRoom] Called with:', { socketId, nickname });
     leaveRoom(socketId);
     let code;
     do {
@@ -857,19 +927,52 @@ export function createRoomsStore({
     };
     rooms.set(code, room);
     socketToRoom.set(socketId, code);
+    console.log('[createRoom] Room created:', { code, sessionId, nickname });
     return { room, player };
   }
 
-  function joinRoom(socketId, code, nickname) {
+  function joinRoom(socketId, code, nickname, existingSessionId = null) {
+    console.log('[joinRoom] Called with:', { socketId, code, nickname, existingSessionId });
     leaveRoom(socketId);
     const room = rooms.get(String(code || "").toUpperCase());
     if (!room) {
+      console.log('[joinRoom] Room not found');
       return { error: "Salle introuvable." };
     }
     if (room.phase !== "lobby") {
+      console.log('[joinRoom] Room not in lobby, phase:', room.phase);
       if (room.phase === "finished") {
         return { error: "Cette partie est terminée." };
       }
+
+      // Check if we are trying to rejoin an existing session
+      if (existingSessionId) {
+        console.log('[joinRoom] Attempting rejoin with sessionId:', existingSessionId);
+        let foundPlayer = null;
+        for (const p of room.players.values()) {
+          if (p.sessionId === existingSessionId) {
+            foundPlayer = p;
+            break;
+          }
+        }
+        if (foundPlayer) {
+          const oldSocketId = foundPlayer.socketId;
+          foundPlayer.socketId = socketId;
+          foundPlayer.disconnectedAt = null;
+          if (oldSocketId && oldSocketId !== socketId) {
+            room.players.delete(oldSocketId);
+            socketToRoom.delete(oldSocketId);
+          }
+          room.players.set(socketId, foundPlayer);
+          socketToRoom.set(socketId, room.code);
+          if (room.hostId === oldSocketId) {
+            room.hostId = socketId;
+          }
+          console.log('[joinRoom] Rejoin successful for:', foundPlayer.nickname);
+          return { room, player: foundPlayer, isRejoin: true };
+        }
+      }
+
       return {
         error: "La partie a déjà commencé. Demandez à l'hôte de vous accepter.",
         joinRequestPossible: true,
@@ -880,6 +983,7 @@ export function createRoomsStore({
     const normalizedNickname = String(nickname || "Joueur").slice(0, 24).toLowerCase();
     for (const player of room.players.values()) {
       if (player.nickname.toLowerCase() === normalizedNickname) {
+        console.log('[joinRoom] Duplicate nickname:', normalizedNickname);
         return { error: "Ce pseudo est déjà utilisé dans cette partie." };
       }
     }
@@ -902,6 +1006,7 @@ export function createRoomsStore({
     };
     room.players.set(socketId, player);
     socketToRoom.set(socketId, room.code);
+    console.log('[joinRoom] Joined room:', { code, sessionId, nickname });
     return { room, player };
   }
 
@@ -987,25 +1092,34 @@ export function createRoomsStore({
   }
 
   function startRoles(socketId) {
+    console.log('[startRoles] Called with:', { socketId });
     const code = socketToRoom.get(socketId);
-    if (!code) return { error: "Pas dans une salle." };
+    if (!code) {
+      console.log('[startRoles] No code found');
+      return { error: "Pas dans une salle." };
+    }
     const room = rooms.get(code);
     if (!room || room.hostId !== socketId) {
+      console.log('[startRoles] Not host or room not found');
       return { error: "Seul l'hôte peut lancer la révélation." };
     }
     if (room.phase !== "lobby") {
+      console.log('[startRoles] Not in lobby phase:', room.phase);
       return { error: "Les rôles sont déjà attribués." };
     }
     const list = [...room.players.values()];
     if (list.length < 2) {
+      console.log('[startRoles] Not enough players:', list.length);
       return { error: "Au moins 2 joueurs sont nécessaires pour lancer." };
     }
     const { catCount } = room.settings;
     if (catCount >= list.length) {
+      console.log('[startRoles] Too many cats:', catCount, 'players:', list.length);
       return { error: "Le nombre de chats doit être inférieur au nombre de joueurs." };
     }
     const center = computeGameCenter(room);
     if (!center) {
+      console.log('[startRoles] No game center');
       return {
         error:
           "Position GPS indisponible pour le centre de la zone. Activez le GPS.",
@@ -1014,7 +1128,9 @@ export function createRoomsStore({
     room.gameCenter = center;
     room.phase = "role_reveal";
     room.catMapUnlockAt = null;
+    console.log('[startRoles] Game center set:', center);
     if ((room.settings.catAssignmentMode || "random") === "manual") {
+      console.log('[startRoles] Manual assignment mode');
       list.forEach((p) => {
         p.role = "player";
         p.originalRole = "player";
@@ -1027,6 +1143,7 @@ export function createRoomsStore({
         p.jamAnchorLng = null;
       });
     } else {
+      console.log('[startRoles] Random assignment mode, catCount:', catCount);
       const shuffled = [...list].sort(() => Math.random() - 0.5);
       shuffled.forEach((p, i) => {
         const r = i < catCount ? "cat" : "player";
@@ -1039,26 +1156,36 @@ export function createRoomsStore({
         p.jamCircleCenter = null;
         p.jamAnchorLat = null;
         p.jamAnchorLng = null;
+        console.log('[startRoles] Assigned role', r, 'to', p.nickname);
       });
     }
+    console.log('[startRoles] Roles started successfully');
     return { ok: true, room };
   }
 
   function beginHunt(socketId) {
+    console.log('[beginHunt] Called with:', { socketId });
     const code = socketToRoom.get(socketId);
-    if (!code) return { error: "Pas dans une salle." };
+    if (!code) {
+      console.log('[beginHunt] No code found');
+      return { error: "Pas dans une salle." };
+    }
     const room = rooms.get(code);
     if (!room || room.hostId !== socketId) {
+      console.log('[beginHunt] Not host or room not found');
       return { error: "Seul l'hôte peut démarrer la chasse." };
     }
     if (room.phase !== "role_reveal") {
+      console.log('[beginHunt] Not in role_reveal phase:', room.phase);
       return { error: "Révélez d'abord les rôles." };
     }
     const list = [...room.players.values()];
     if (list.length < 2) {
+      console.log('[beginHunt] Not enough players:', list.length);
       return { error: "Au moins 2 joueurs sont nécessaires." };
     }
     if ((room.settings.gameMode || "tag_swap") === "infection" && list.length <= 2) {
+      console.log('[beginHunt] Infection mode needs 3+ players');
       return { error: "Le mode chats cumulés nécessite au moins 3 joueurs." };
     }
     if ((room.settings.catAssignmentMode || "random") === "manual") {
@@ -1068,6 +1195,7 @@ export function createRoomsStore({
         if (p.role === "cat" && !p.spectator) cats++;
       }
       if (cats !== catCount) {
+        console.log('[beginHunt] Wrong cat count:', cats, 'expected:', catCount);
         return {
           error: `En mode manuel, choisissez exactement ${catCount} chat(s). Actuellement : ${cats}.`,
         };
@@ -1089,6 +1217,7 @@ export function createRoomsStore({
     });
     const delayMs = Math.max(0, Number(room.settings.catDelayMinutes) || 0) * 60 * 1000;
     room.catMapUnlockAt = Date.now() + delayMs;
+    console.log('[beginHunt] Hunt started, cat map unlock at:', new Date(room.catMapUnlockAt));
     return { ok: true, room };
   }
 
@@ -1160,34 +1289,56 @@ export function createRoomsStore({
   }
 
   function setPosition(socketId, lat, lng) {
-    const code = socketToRoom.get(socketId);
-    if (!code) return null;
-    const room = rooms.get(code);
-    if (!room) return null;
-    if (room.phase === "finished") return null;
-    const p = room.players.get(socketId);
-    if (!p) return null;
-    const la = Number(lat);
-    const lo = Number(lng);
-    if (!Number.isFinite(la) || !Number.isFinite(lo)) return null;
-    if (la < -90 || la > 90 || lo < -180 || lo > 180) return null;
+  console.log('[setPosition] Called with:', { socketId, lat, lng });
+  const code = socketToRoom.get(socketId);
+  if (!code) {
+    console.log('[setPosition] No code found for socketId');
+    return null;
+  }
+  const room = rooms.get(code);
+  if (!room) {
+    console.log('[setPosition] Room not found');
+    return null;
+  }
+  if (room.phase === "finished") {
+    console.log('[setPosition] Room finished');
+    return null;
+  }
+  const p = room.players.get(socketId);
+  if (!p) {
+    console.log('[setPosition] Player not found');
+    return null;
+  }
+  const la = Number(lat);
+  const lo = Number(lng);
+  if (!Number.isFinite(la) || !Number.isFinite(lo)) {
+    console.log('[setPosition] Invalid coordinates');
+    return null;
+  }
+  if (la < -90 || la > 90 || lo < -180 || lo > 180) {
+    console.log('[setPosition] Coordinates out of range');
+    return null;
+  }
+  
+  // Check out of bounds status changes
+  if (room.phase === "playing" && !p.spectator && !p.captured && room.gameCenter) {
+    const wasOutOfBounds = p.lat != null && p.lng != null ? !isInsideGameZone(p.lat, p.lng, room) : false;
+    const isNowOutOfBounds = !isInsideGameZone(la, lo, room);
     
-    // Check out of bounds status changes
-    if (room.phase === "playing" && !p.spectator && !p.captured && room.gameCenter) {
-      const wasOutOfBounds = p.lat != null && p.lng != null ? !isInsideGameZone(p.lat, p.lng, room) : false;
-      const isNowOutOfBounds = !isInsideGameZone(la, lo, room);
-      
-      if (!wasOutOfBounds && isNowOutOfBounds) {
-        p.justWentOutOfBounds = true;
-      }
-      if (wasOutOfBounds && !isNowOutOfBounds) {
-        p.justReenteredZone = true;
-      }
+    if (!wasOutOfBounds && isNowOutOfBounds) {
+      p.justWentOutOfBounds = true;
+      console.log('[setPosition] Player went out of bounds:', p.nickname);
     }
+    if (wasOutOfBounds && !isNowOutOfBounds) {
+      p.justReenteredZone = true;
+      console.log('[setPosition] Player reentered zone:', p.nickname);
+    }
+  }
 
-    p.lat = la;
-    p.lng = lo;
-    return { room, player: p };
+  p.lat = la;
+  p.lng = lo;
+  console.log('[setPosition] Position updated for:', p.nickname);
+  return { room, player: p };
   }
 
   function buildLobbyPayload(room, io = null) {
@@ -1868,7 +2019,8 @@ export function createRoomsStore({
         room.hostId = room.players.keys().next().value;
       }
     } else {
-      // If game started, just mark as disconnected
+      // If game started, just mark as disconnected but DO NOT remove from players map
+      // This allows them to rejoin later with their role
       player.disconnectedAt = Date.now();
     }
 

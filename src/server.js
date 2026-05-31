@@ -225,8 +225,8 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("join_room", ({ code, nickname }, cb) => {
-    const result = store.joinRoom(socket.id, code, nickname);
+  socket.on("join_room", ({ code, nickname, sessionId: existingSessionId }, cb) => {
+    const result = store.joinRoom(socket.id, code, nickname, existingSessionId);
     if (result.error) {
       cb?.({
         ok: false,
@@ -236,7 +236,7 @@ io.on("connection", (socket) => {
       });
       return;
     }
-    const { room, player } = result;
+    const { room, player, isRejoin } = result;
     socket.join(room.code);
 
     // Enregistrer la session pour la reconnexion
@@ -246,6 +246,41 @@ io.on("connection", (socket) => {
       nickname: player.nickname,
     });
 
+    const isHost = room.hostId === socket.id;
+
+    // Si c'est un rejoin (manuel via la modale), on envoie l'état complet selon la phase
+    if (isRejoin) {
+      let payload;
+      if (room.phase === "lobby") {
+        payload = store.buildLobbyPayload(room, io);
+        io.to(room.code).emit("lobby_update", payload);
+      } else if (room.phase === "role_reveal") {
+        payload = store.buildRolesRevealPayload(room);
+        io.to(room.code).emit("roles_reveal", payload);
+      } else if (room.phase === "playing") {
+        store.broadcastPlayingState(io, room);
+        payload = store.buildPlayingPayloadForSocket(room, socket.id, io);
+      }
+
+      socket.to(room.code).emit("player_reconnected", {
+        nickname: player.nickname,
+        sessionId: player.sessionId,
+      });
+
+      cb?.({
+        ok: true,
+        code: room.code,
+        sessionId: player.sessionId,
+        isHost,
+        phase: room.phase,
+        lobby: room.phase === "lobby" ? payload : null,
+        rolesReveal: room.phase === "role_reveal" ? payload : null,
+        gameState: room.phase === "playing" ? payload : null,
+      });
+      return;
+    }
+
+    // Join classique (lobby)
     const payload = store.buildLobbyPayload(room, io);
     io.to(room.code).emit("lobby_update", payload);
     cb?.({
