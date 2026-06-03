@@ -4,6 +4,7 @@ import {
   randomOffsetPoint,
   isInsideRadius,
   isInsideAnyPolygon,
+  offsetMeters,
 } from "./geo.js";
 
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -44,10 +45,6 @@ const defaultSettings = () => {
   catDelayMinutes: 5,
   /** Zone globale qui rétrécit avec le temps */
   shrinkZoneEnabled: false,
-  shrinkDurationMinutes: 15,
-  shrinkMinRadiusM: 100,
-  /** Nombre de paliers de rayon (diamètres discrets) */
-  shrinkPhases: 5,
   /** Fin forcée après X minutes (désactivable) */
   timeLimitEnabled: false,
   timeLimitMinutes: 30,
@@ -63,47 +60,171 @@ const defaultSettings = () => {
 /** Paliers de rayon + métadonnées pour l'UI (phase suivante, fin de palier). */
 function getShrinkState(room) {
   const R0 = Number(room.settings.globalRadiusM) || 500;
-  if (
-    !room.settings.shrinkZoneEnabled ||
-    !room.huntStartedAt
-  ) {
-    const result = {
+  if (!room.settings.shrinkZoneEnabled || !room.huntStartedAt || !room.shrinkPhasesList) {
+    return {
       currentRadius: R0,
+      currentCenter: room.gameCenter,
       nextRadius: null,
+      nextCenter: null,
       phaseEndsAt: null,
       currentPhase: 1,
       totalPhases: 1,
     };
-    return result;
   }
-  const durMin = Math.max(1, Number(room.settings.shrinkDurationMinutes) || 15);
-  const Rmin = Math.min(
-    R0,
-    Math.max(20, Number(room.settings.shrinkMinRadiusM) || 80)
-  );
-  const phases = Math.max(
-    2,
-    Math.min(20, Math.floor(Number(room.settings.shrinkPhases)) || 5)
-  );
-  const durMs = durMin * 60 * 1000;
-  const radii = [];
-  for (let i = 0; i < phases; i++) {
-    radii.push(R0 + (Rmin - R0) * (i / Math.max(1, phases - 1)));
+
+  function recomputeRemainingShrink(room) {
+    if (!room.settings.shrinkZoneEnabled || !room.huntStartedAt) return;
+    const now = Date.now();
+    const elapsed = now - room.huntStartedAt;
+    const totalMs = Math.max(1, Number(room.settings.timeLimitMinutes) || 30) * 60 * 1000;
+    const remainingMs = totalMs - elapsed;
+    if (remainingMs <= 0) return;
+
+    const shrink = getShrinkState(room);
+    const R0now = Number(shrink.currentRadius) || Number(room.settings.globalRadiusM) || 500;
+    const Rmin = 50;
+
+    // Keep past phases intact
+    const past = Array.isArray(room.shrinkPhasesList)
+      ? room.shrinkPhasesList.filter((ph) => (room.huntStartedAt + ph.endTime) <= now)
+      : [];
+
+    // Decide number of remaining phases based on remaining time (variable paliers)
+    let count;
+    if (remainingMs < 4 * 60 * 1000) count = 2;
+    else if (remainingMs < 8 * 60 * 1000) count = 3;
+    else if (remainingMs < 14 * 60 * 1000) count = 4;
+    else count = 5;
+
+    // Build radii and centers from current state to final
+    let currentCenter = shrink.currentCenter || room.gameCenter;
+    const zones = [];
+    for (let i = 0; i <= count; i++) {
+      const x = i / count;
+      const r = Rmin + (R0now - Rmin) * (1 - x * x);
+      if (i === 0) zones.push({ center: currentCenter, radius: r });
+      else {
+        const prev = zones[i - 1];
+        const maxOffset = Math.max(0, prev.radius - r);
+        const dist = Math.random() * maxOffset * 0.8;
+        const angle = Math.random() * 2 * Math.PI;
+        currentCenter = offsetMeters(prev.center.lat, prev.center.lng, angle * (180 / Math.PI), dist);
+        zones.push({ center: currentCenter, radius: r });
+      }
+    }
+
+    // Weights and ratios for remaining phases
+    const weights = [];
+    for (let i = 0; i < count; i++) {
+      const isFirst = i === 0;
+      const isLast = i === count - 1;
+      const isSecondLast = i === count - 2;
+      let waitRatio, shrinkRatio;
+      if (isLast) { waitRatio = 1.0; shrinkRatio = 0.0; }
+      else if (isSecondLast) { waitRatio = 0.8; shrinkRatio = 0.2; }
+      else if (isFirst) { waitRatio = 0.6; shrinkRatio = 0.4; }
+      else { waitRatio = 0.4; shrinkRatio = 0.6; }
+
+      let w;
+      if (isFirst) w = 2.5; else if (i === 1) w = 1.8; else if (isSecondLast) w = 1.4; else if (isLast) w = 1.6; else w = 1.0;
+      weights.push({ waitRatio, shrinkRatio, w });
+    }
+    const totalW = weights.reduce((s, p) => s + p.w, 0) || 1;
+
+    const phases = [];
+    let t = elapsed;
+    for (let i = 0; i < count; i++) {
+      const p = weights[i];
+      const dur = remainingMs * (p.w / totalW);
+      const startTime = t;
+      const endTime = t + dur;
+      phases.push({
+        startTime,
+        endTime,
+        waitRatio: p.waitRatio,
+        shrinkRatio: p.shrinkRatio,
+        startZone: zones[i],
+        endZone: zones[i + 1],
+      });
+      t = endTime;
+    }
+
+    room.shrinkPhasesList = past.concat(phases);
   }
+
+  function adminAddTime(io, socketId, minutes) {
+    const code = socketToRoom.get(socketId);
+    if (!code) return { error: "Pas dans une salle." };
+    const room = rooms.get(code);
+    if (!room || room.hostId !== socketId) return { error: "Seul l'hôte peut modifier la durée." };
+    if (room.phase !== "playing") return { error: "Partie non démarrée." };
+    const add = Math.max(1, Math.floor(Number(minutes) || 0));
+    room.settings.timeLimitEnabled = true;
+    room.settings.timeLimitMinutes = Math.min(180, (Number(room.settings.timeLimitMinutes) || 30) + add);
+    recomputeRemainingShrink(room);
+    broadcastPlayingState(io, room);
+    return { ok: true, room };
+  }
+
   const elapsed = Date.now() - room.huntStartedAt;
-  const segMs = durMs / phases;
-  const idx = Math.min(phases - 1, Math.floor(elapsed / segMs));
-  const currentRadius = radii[idx];
-  const nextRadius = idx < phases - 1 ? radii[idx + 1] : null;
-  const phaseEndsAt = room.huntStartedAt + (idx + 1) * segMs;
-  const result = {
+  const phases = room.shrinkPhasesList;
+  const totalPhases = phases.length;
+  
+  // Find current phase
+  let currentPhaseInfo = phases[totalPhases - 1]; // default to last
+  let phaseIdx = totalPhases - 1;
+  
+  for (let i = 0; i < totalPhases; i++) {
+    if (elapsed < phases[i].endTime) {
+      currentPhaseInfo = phases[i];
+      phaseIdx = i;
+      break;
+    }
+  }
+
+  // Wait time and shrink time are driven by the pre-calculated waitRatio
+  const phaseDuration = currentPhaseInfo.endTime - currentPhaseInfo.startTime;
+  const shrinkStartTime = currentPhaseInfo.startTime + phaseDuration * currentPhaseInfo.waitRatio;
+
+  let currentRadius, currentCenter;
+  
+  if (elapsed < shrinkStartTime) {
+    // Waiting: keep start zone
+    currentRadius = currentPhaseInfo.startZone.radius;
+    currentCenter = currentPhaseInfo.startZone.center;
+  } else if (elapsed < currentPhaseInfo.endTime) {
+    // Shrinking: interpolate between start and end
+    const progress = (elapsed - shrinkStartTime) / (phaseDuration * currentPhaseInfo.shrinkRatio);
+    currentRadius = currentPhaseInfo.startZone.radius + (currentPhaseInfo.endZone.radius - currentPhaseInfo.startZone.radius) * progress;
+    
+    const latOffset = (currentPhaseInfo.endZone.center.lat - currentPhaseInfo.startZone.center.lat) * progress;
+    const lngOffset = (currentPhaseInfo.endZone.center.lng - currentPhaseInfo.startZone.center.lng) * progress;
+    currentCenter = {
+      lat: currentPhaseInfo.startZone.center.lat + latOffset,
+      lng: currentPhaseInfo.startZone.center.lng + lngOffset
+    };
+  } else {
+    // Past phase end (should only happen for last phase if game didn't end)
+    currentRadius = currentPhaseInfo.endZone.radius;
+    currentCenter = currentPhaseInfo.endZone.center;
+  }
+
+  return {
     currentRadius,
-    nextRadius,
-    phaseEndsAt,
-    currentPhase: idx + 1,
-    totalPhases: phases,
+    currentCenter,
+    nextRadius: currentPhaseInfo.endZone.radius,
+    nextCenter: currentPhaseInfo.endZone.center,
+    phaseEndsAt: room.huntStartedAt + currentPhaseInfo.endTime,
+    shrinkStartsAt: room.huntStartedAt + shrinkStartTime,
+    phaseState:
+      elapsed < shrinkStartTime
+        ? "waiting"
+        : elapsed < currentPhaseInfo.endTime
+          ? "shrinking"
+          : "stopped",
+    currentPhase: phaseIdx + 1,
+    totalPhases,
   };
-  return result;
 }
 
 function getEffectiveGlobalRadius(room) {
@@ -112,8 +233,9 @@ function getEffectiveGlobalRadius(room) {
 }
 
 function isInsideGameZone(lat, lng, room) {
-  const gc = room.gameCenter;
-  const r = getEffectiveGlobalRadius(room);
+  const shrinkState = getShrinkState(room);
+  const gc = shrinkState.currentCenter;
+  const r = shrinkState.currentRadius;
   const result = isInsideRadius(lat, lng, gc, r);
   return result;
 }
@@ -234,9 +356,9 @@ function pickPointOnWayGeometry(geometry) {
   return { lat, lng };
 }
 
-function isOsmCandidateSafe(candidate, blockedAreas, room, effectiveRadius, baliseRadiusM) {
+function isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM) {
   if (!isInsideGameZone(candidate.lat, candidate.lng, room)) return false;
-  if (haversineMeters(candidate.lat, candidate.lng, room.gameCenter.lat, room.gameCenter.lng) > effectiveRadius - baliseRadiusM) return false;
+  if (haversineMeters(candidate.lat, candidate.lng, effectiveCenter.lat, effectiveCenter.lng) > effectiveRadius - baliseRadiusM) return false;
   for (const area of blockedAreas) {
     if (pointInOsmPolygon(candidate.lat, candidate.lng, area.geometry)) return false;
   }
@@ -307,16 +429,16 @@ out center geom;`;
   }
 }
 
-async function pickOsmBalisePosition(room, effectiveRadius, baliseRadiusM) {
+async function pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM) {
   try {
-    const { walkways, crossingNodes, blockedAreas } = await fetchOsmBaliseCandidates(room.gameCenter, effectiveRadius);
+    const { walkways, crossingNodes, blockedAreas } = await fetchOsmBaliseCandidates(effectiveCenter, effectiveRadius);
 
     // Build a mixed pool of candidates: points from ways (random geometry nodes) and crossing nodes directly
     const wayPool = [...walkways].sort(() => Math.random() - 0.5);
     for (const way of wayPool) {
       for (let i = 0; i < 8; i++) {
         const candidate = pickPointOnWayGeometry(way.geometry);
-        if (candidate && isOsmCandidateSafe(candidate, blockedAreas, room, effectiveRadius, baliseRadiusM)) {
+        if (candidate && isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM)) {
           return { ...candidate, source: "osm", osmWayId: way.id };
         }
       }
@@ -325,7 +447,7 @@ async function pickOsmBalisePosition(room, effectiveRadius, baliseRadiusM) {
     const nodePool = [...crossingNodes].sort(() => Math.random() - 0.5);
     for (const node of nodePool) {
       const candidate = { lat: Number(node.lat), lng: Number(node.lon) };
-      if (isOsmCandidateSafe(candidate, blockedAreas, room, effectiveRadius, baliseRadiusM)) {
+      if (isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM)) {
         return { ...candidate, source: "osm", osmNodeId: node.id };
       }
     }
@@ -335,12 +457,12 @@ async function pickOsmBalisePosition(room, effectiveRadius, baliseRadiusM) {
   return null;
 }
 
-function pickFallbackBalisePosition(room, effectiveRadius, baliseRadiusM) {
+function pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM) {
   let position = null;
   for (let i = 0; i < 20; i++) {
     const candidate = randomOffsetPoint(
-      room.gameCenter.lat,
-      room.gameCenter.lng,
+      effectiveCenter.lat,
+      effectiveCenter.lng,
       Math.max(1, effectiveRadius - baliseRadiusM),
       0.15,
       0.9
@@ -355,8 +477,8 @@ function pickFallbackBalisePosition(room, effectiveRadius, baliseRadiusM) {
     }
   }
   return position || randomOffsetPoint(
-    room.gameCenter.lat,
-    room.gameCenter.lng,
+    effectiveCenter.lat,
+    effectiveCenter.lng,
     Math.max(1, effectiveRadius - baliseRadiusM),
     0.15,
     0.9
@@ -365,11 +487,13 @@ function pickFallbackBalisePosition(room, effectiveRadius, baliseRadiusM) {
 
 async function spawnBalise(room) {
   if (!room.gameCenter) return;
-  const effectiveRadius = getEffectiveGlobalRadius(room);
+  const shrink = getShrinkState(room);
+  const effectiveCenter = shrink.currentCenter || room.gameCenter;
+  const effectiveRadius = shrink.currentRadius || getEffectiveGlobalRadius(room);
   const radiusFactor = 0.04 + Math.random() * 0.04;
   const baliseRadiusM = Math.max(18, Math.min(55, Math.round(effectiveRadius * radiusFactor)));
-  const position = await pickOsmBalisePosition(room, effectiveRadius, baliseRadiusM) ||
-    pickFallbackBalisePosition(room, effectiveRadius, baliseRadiusM);
+  const position = await pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM) ||
+    pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM);
   
   // Remove all existing balises (only one active at a time)
   room.balises = [];
@@ -498,29 +622,33 @@ function appendLocationSample(room, player) {
 function effectiveGlobalRadiusAtTimestamp(room, absT) {
   const settings = room.settings || {};
   const R0 = Number(settings.globalRadiusM) || 500;
-  if (!settings.shrinkZoneEnabled || !room.huntStartedAt) return R0;
-  const durMs = Math.max(
-    60000,
-    (Number(settings.shrinkDurationMinutes) || 15) * 60 * 1000
-  );
-  const Rmin = Math.min(
-    R0,
-    Math.max(20, Number(settings.shrinkMinRadiusM) || 80)
-  );
-  const phases = Math.max(
-    2,
-    Math.min(20, Math.floor(Number(settings.shrinkPhases)) || 5)
-  );
+  if (!settings.shrinkZoneEnabled || !room.huntStartedAt || !room.shrinkPhasesList) return R0;
+  
   const elapsed = absT - room.huntStartedAt;
+  const phases = room.shrinkPhasesList;
+  const totalPhases = phases.length;
+  
   if (elapsed <= 0) return R0;
-  const segMs = durMs / phases;
-  const idx = Math.min(
-    phases - 1,
-    Math.floor(elapsed / Math.max(1, segMs))
-  );
-  const ratio = idx / Math.max(1, phases - 1);
-  const radius = R0 + (Rmin - R0) * ratio;
-  return radius > 0 ? radius : R0;
+  
+  let currentPhaseInfo = phases[totalPhases - 1];
+  for (let i = 0; i < totalPhases; i++) {
+    if (elapsed < phases[i].endTime) {
+      currentPhaseInfo = phases[i];
+      break;
+    }
+  }
+
+  const phaseDuration = currentPhaseInfo.endTime - currentPhaseInfo.startTime;
+  const shrinkStartTime = currentPhaseInfo.startTime + phaseDuration * currentPhaseInfo.waitRatio;
+  
+  if (elapsed < shrinkStartTime) {
+    return currentPhaseInfo.startZone.radius;
+  } else if (elapsed < currentPhaseInfo.endTime) {
+    const progress = (elapsed - shrinkStartTime) / (phaseDuration * currentPhaseInfo.shrinkRatio);
+    return currentPhaseInfo.startZone.radius + (currentPhaseInfo.endZone.radius - currentPhaseInfo.startZone.radius) * progress;
+  } else {
+    return currentPhaseInfo.endZone.radius;
+  }
 }
 
 function computePlayerAnalytics(room, timeline) {
@@ -1155,6 +1283,91 @@ export function createRoomsStore({
     }
     room.phase = "playing";
     room.huntStartedAt = Date.now();
+    
+    // Generate Fortnite-like shrink zones
+    if (room.settings.shrinkZoneEnabled) {
+      const timeLimitMs = Math.max(1, Number(room.settings.timeLimitMinutes) || 30) * 60 * 1000;
+      const R0 = Number(room.settings.globalRadiusM) || 500;
+      const Rmin = 50; // hardcode 50m minimum
+      const phaseCount = 6; // Hardcode exactly 6 phases to ensure a good distribution
+      
+      let currentCenter = { ...room.gameCenter };
+      const zones = [];
+      const phasesList = [];
+      
+      const phaseWeights = [];
+      for (let i = 0; i < phaseCount; i++) {
+        const isFirst = i === 0;
+        const isLast = i === phaseCount - 1;
+        const isSecondLast = i === phaseCount - 2;
+
+        let waitRatio, shrinkRatio;
+        if (isLast) {
+          waitRatio = 1.0;
+          shrinkRatio = 0.0;
+        } else if (isSecondLast) {
+          waitRatio = 0.8;
+          shrinkRatio = 0.2; 
+        } else if (isFirst) {
+          waitRatio = 0.7;
+          shrinkRatio = 0.3;
+        } else {
+          waitRatio = 0.4;
+          shrinkRatio = 0.6;
+        }
+
+        let weight;
+        if (i === 0) weight = 3; 
+        else if (i === 1) weight = 2;
+        else if (isLast) weight = 1.5; 
+        else if (isSecondLast) weight = 1.5; 
+        else weight = 1;
+
+        phaseWeights.push({ weight, waitRatio, shrinkRatio });
+      }
+
+      const totalWeight = phaseWeights.reduce((sum, p) => sum + p.weight, 0);
+
+      let timeAccum = 0;
+      for (let i = 0; i <= phaseCount; i++) {
+        const x = i / phaseCount;
+        const r = Rmin + (R0 - Rmin) * (1 - x * x);
+        
+        if (i === 0) {
+          zones.push({ center: currentCenter, radius: r });
+        } else {
+          const prev = zones[i-1];
+          const maxOffset = Math.max(0, prev.radius - r);
+          // random offset inside
+          const dist = Math.random() * maxOffset * 0.8; 
+          const angle = Math.random() * 2 * Math.PI;
+          currentCenter = offsetMeters(prev.center.lat, prev.center.lng, angle * (180 / Math.PI), dist);
+          zones.push({ center: currentCenter, radius: r });
+        }
+      }
+      
+      for (let i = 0; i < phaseCount; i++) {
+        const p = phaseWeights[i];
+        const durationMs = timeLimitMs * (p.weight / totalWeight);
+        
+        const startMs = timeAccum;
+        timeAccum += durationMs;
+        const endMs = timeAccum;
+
+        phasesList.push({
+          startTime: startMs,
+          endTime: endMs,
+          waitRatio: p.waitRatio,
+          shrinkRatio: p.shrinkRatio,
+          startZone: zones[i],
+          endZone: zones[i+1]
+        });
+      }
+      room.shrinkPhasesList = phasesList;
+    } else {
+      room.shrinkPhasesList = null;
+    }
+
     room.traceBySession = {};
     room.jamHistory = [];
     room._lastJamSample = {};
@@ -1335,6 +1548,7 @@ export function createRoomsStore({
     const center = room.gameCenter;
     const shrinkMeta = getShrinkState(room);
     const effectiveGlobalRadiusM = shrinkMeta.currentRadius;
+    const effectiveGlobalCenter = shrinkMeta.currentCenter || center;
     const catMapLocked = isCatMapLocked(room, viewer);
     const mapUnlockAt = room.catMapUnlockAt;
     const huntStartedAt = room.huntStartedAt;
@@ -1365,9 +1579,13 @@ export function createRoomsStore({
         hostCatMapPreview: Boolean(room.settings.hostCatMapPreview),
       },
       gameCenter: center,
+      effectiveGlobalCenter,
       effectiveGlobalRadiusM,
+      nextPhaseCenter: shrinkMeta.nextCenter,
       nextPhaseRadiusM: shrinkMeta.nextRadius,
       phaseEndsAt: shrinkMeta.phaseEndsAt,
+      shrinkStartsAt: shrinkMeta.shrinkStartsAt || null,
+      zonePhaseState: shrinkMeta.phaseState || null,
       currentPhase: shrinkMeta.currentPhase,
       totalPhases: shrinkMeta.totalPhases,
       huntStartedAt,
@@ -2018,6 +2236,7 @@ export function createRoomsStore({
     adminKick,
     adminSetRole,
     adminEndGame,
+    adminAddTime,
     appendLocationSample,
     requestJoinMidgame,
     respondJoinRequest,

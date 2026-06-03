@@ -382,6 +382,12 @@ io.on("connection", (socket) => {
     else cb?.({ ok: true });
   });
 
+  socket.on("admin_add_time", ({ minutes }, cb) => {
+    const r = store.adminAddTime(io, socket.id, minutes);
+    if (r.error) cb?.({ ok: false, error: r.error });
+    else cb?.({ ok: true });
+  });
+
   socket.on("request_join_midgame", ({ code, nickname }, cb) => {
     const r = store.requestJoinMidgame(socket.id, code, nickname, io);
     if (r.error) {
