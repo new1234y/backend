@@ -72,100 +72,6 @@ function getShrinkState(room) {
     };
   }
 
-  function recomputeRemainingShrink(room) {
-    if (!room.settings.shrinkZoneEnabled || !room.huntStartedAt) return;
-    const now = Date.now();
-    const elapsed = now - room.huntStartedAt;
-    const totalMs = Math.max(1, Number(room.settings.timeLimitMinutes) || 30) * 60 * 1000;
-    const remainingMs = totalMs - elapsed;
-    if (remainingMs <= 0) return;
-
-    const shrink = getShrinkState(room);
-    const R0now = Number(shrink.currentRadius) || Number(room.settings.globalRadiusM) || 500;
-    const Rmin = 50;
-
-    // Keep past phases intact
-    const past = Array.isArray(room.shrinkPhasesList)
-      ? room.shrinkPhasesList.filter((ph) => (room.huntStartedAt + ph.endTime) <= now)
-      : [];
-
-    // Decide number of remaining phases based on remaining time (variable paliers)
-    let count;
-    if (remainingMs < 4 * 60 * 1000) count = 2;
-    else if (remainingMs < 8 * 60 * 1000) count = 3;
-    else if (remainingMs < 14 * 60 * 1000) count = 4;
-    else count = 5;
-
-    // Build radii and centers from current state to final
-    let currentCenter = shrink.currentCenter || room.gameCenter;
-    const zones = [];
-    for (let i = 0; i <= count; i++) {
-      const x = i / count;
-      const r = Rmin + (R0now - Rmin) * (1 - x * x);
-      if (i === 0) zones.push({ center: currentCenter, radius: r });
-      else {
-        const prev = zones[i - 1];
-        const maxOffset = Math.max(0, prev.radius - r);
-        const dist = Math.random() * maxOffset * 0.8;
-        const angle = Math.random() * 2 * Math.PI;
-        currentCenter = offsetMeters(prev.center.lat, prev.center.lng, angle * (180 / Math.PI), dist);
-        zones.push({ center: currentCenter, radius: r });
-      }
-    }
-
-    // Weights and ratios for remaining phases
-    const weights = [];
-    for (let i = 0; i < count; i++) {
-      const isFirst = i === 0;
-      const isLast = i === count - 1;
-      const isSecondLast = i === count - 2;
-      let waitRatio, shrinkRatio;
-      if (isLast) { waitRatio = 1.0; shrinkRatio = 0.0; }
-      else if (isSecondLast) { waitRatio = 0.8; shrinkRatio = 0.2; }
-      else if (isFirst) { waitRatio = 0.6; shrinkRatio = 0.4; }
-      else { waitRatio = 0.4; shrinkRatio = 0.6; }
-
-      let w;
-      if (isFirst) w = 2.5; else if (i === 1) w = 1.8; else if (isSecondLast) w = 1.4; else if (isLast) w = 1.6; else w = 1.0;
-      weights.push({ waitRatio, shrinkRatio, w });
-    }
-    const totalW = weights.reduce((s, p) => s + p.w, 0) || 1;
-
-    const phases = [];
-    let t = elapsed;
-    for (let i = 0; i < count; i++) {
-      const p = weights[i];
-      const dur = remainingMs * (p.w / totalW);
-      const startTime = t;
-      const endTime = t + dur;
-      phases.push({
-        startTime,
-        endTime,
-        waitRatio: p.waitRatio,
-        shrinkRatio: p.shrinkRatio,
-        startZone: zones[i],
-        endZone: zones[i + 1],
-      });
-      t = endTime;
-    }
-
-    room.shrinkPhasesList = past.concat(phases);
-  }
-
-  function adminAddTime(io, socketId, minutes) {
-    const code = socketToRoom.get(socketId);
-    if (!code) return { error: "Pas dans une salle." };
-    const room = rooms.get(code);
-    if (!room || room.hostId !== socketId) return { error: "Seul l'hôte peut modifier la durée." };
-    if (room.phase !== "playing") return { error: "Partie non démarrée." };
-    const add = Math.max(1, Math.floor(Number(minutes) || 0));
-    room.settings.timeLimitEnabled = true;
-    room.settings.timeLimitMinutes = Math.min(180, (Number(room.settings.timeLimitMinutes) || 30) + add);
-    recomputeRemainingShrink(room);
-    broadcastPlayingState(io, room);
-    return { ok: true, room };
-  }
-
   const elapsed = Date.now() - room.huntStartedAt;
   const phases = room.shrinkPhasesList;
   const totalPhases = phases.length;
@@ -1980,6 +1886,96 @@ export function createRoomsStore({
     }
     finishGame(io, room, "admin");
     return { ok: true };
+  }
+
+  function recomputeRemainingShrink(room) {
+    if (!room.settings.shrinkZoneEnabled || !room.huntStartedAt) return;
+    const now = Date.now();
+    const elapsed = now - room.huntStartedAt;
+    const totalMs = Math.max(1, Number(room.settings.timeLimitMinutes) || 30) * 60 * 1000;
+    const remainingMs = totalMs - elapsed;
+    if (remainingMs <= 0) return;
+
+    const shrink = getShrinkState(room);
+    const R0now = Number(shrink.currentRadius) || Number(room.settings.globalRadiusM) || 500;
+    const Rmin = 50;
+
+    const past = Array.isArray(room.shrinkPhasesList)
+      ? room.shrinkPhasesList.filter((ph) => (room.huntStartedAt + ph.endTime) <= now)
+      : [];
+
+    let count;
+    if (remainingMs < 4 * 60 * 1000) count = 2;
+    else if (remainingMs < 8 * 60 * 1000) count = 3;
+    else if (remainingMs < 14 * 60 * 1000) count = 4;
+    else count = 5;
+
+    let currentCenter = shrink.currentCenter || room.gameCenter;
+    const zones = [];
+    for (let i = 0; i <= count; i++) {
+      const x = i / count;
+      const r = Rmin + (R0now - Rmin) * (1 - x * x);
+      if (i === 0) zones.push({ center: currentCenter, radius: r });
+      else {
+        const prev = zones[i - 1];
+        const maxOffset = Math.max(0, prev.radius - r);
+        const dist = Math.random() * maxOffset * 0.8;
+        const angle = Math.random() * 2 * Math.PI;
+        currentCenter = offsetMeters(prev.center.lat, prev.center.lng, angle * (180 / Math.PI), dist);
+        zones.push({ center: currentCenter, radius: r });
+      }
+    }
+
+    const weights = [];
+    for (let i = 0; i < count; i++) {
+      const isFirst = i === 0;
+      const isLast = i === count - 1;
+      const isSecondLast = i === count - 2;
+      let waitRatio, shrinkRatio;
+      if (isLast) { waitRatio = 1.0; shrinkRatio = 0.0; }
+      else if (isSecondLast) { waitRatio = 0.8; shrinkRatio = 0.2; }
+      else if (isFirst) { waitRatio = 0.6; shrinkRatio = 0.4; }
+      else { waitRatio = 0.4; shrinkRatio = 0.6; }
+
+      let w;
+      if (isFirst) w = 2.5; else if (i === 1) w = 1.8; else if (isSecondLast) w = 1.4; else if (isLast) w = 1.6; else w = 1.0;
+      weights.push({ waitRatio, shrinkRatio, w });
+    }
+    const totalW = weights.reduce((s, p) => s + p.w, 0) || 1;
+
+    const phases = [];
+    let t = elapsed;
+    for (let i = 0; i < count; i++) {
+      const p = weights[i];
+      const dur = remainingMs * (p.w / totalW);
+      const startTime = t;
+      const endTime = t + dur;
+      phases.push({
+        startTime,
+        endTime,
+        waitRatio: p.waitRatio,
+        shrinkRatio: p.shrinkRatio,
+        startZone: zones[i],
+        endZone: zones[i + 1],
+      });
+      t = endTime;
+    }
+
+    room.shrinkPhasesList = past.concat(phases);
+  }
+
+  function adminAddTime(io, socketId, minutes) {
+    const code = socketToRoom.get(socketId);
+    if (!code) return { error: "Pas dans une salle." };
+    const room = rooms.get(code);
+    if (!room || room.hostId !== socketId) return { error: "Seul l'hôte peut modifier la durée." };
+    if (room.phase !== "playing") return { error: "Partie non démarrée." };
+    const add = Math.max(1, Math.floor(Number(minutes) || 0));
+    room.settings.timeLimitEnabled = true;
+    room.settings.timeLimitMinutes = Math.min(180, (Number(room.settings.timeLimitMinutes) || 30) + add);
+    recomputeRemainingShrink(room);
+    broadcastPlayingState(io, room);
+    return { ok: true, room };
   }
 
   function requestJoinMidgame(socketId, code, nickname, io) {
