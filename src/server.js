@@ -451,6 +451,24 @@ io.on("connection", (socket) => {
     else cb?.({ ok: true });
   });
 
+  socket.on("use_power", (body, cb) => {
+    const r = store.usePower(io, socket.id, body);
+    if (r.error) cb?.({ ok: false, error: r.error });
+    else cb?.({ ok: true });
+  });
+
+  socket.on("admin_set_power_costs", (partialCosts, cb) => {
+    const r = store.adminSetPowerCosts(io, socket.id, partialCosts || {});
+    if (r.error) cb?.({ ok: false, error: r.error });
+    else cb?.({ ok: true });
+  });
+
+  socket.on("admin_adjust_coins", ({ targetSessionId, delta }, cb) => {
+    const r = store.adminAdjustCoins(io, socket.id, targetSessionId, delta);
+    if (r.error) cb?.({ ok: false, error: r.error });
+    else cb?.({ ok: true, coins: r.coins });
+  });
+
   socket.on("capture_scan", ({ targetSessionId }, cb) => {
     const r = store.tryCapture(io, socket.id, targetSessionId);
     if (r.error) cb?.({ ok: false, error: r.error });

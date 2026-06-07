@@ -62,7 +62,7 @@ function getShrinkState(room) {
   const R0 = Number(room.settings.globalRadiusM) || 500;
   if (!room.settings.shrinkZoneEnabled || !room.huntStartedAt || !room.shrinkPhasesList) {
     return {
-      currentRadius: R0,
+      currentRadius: (Number(room.powerZoneScale || 1) * R0),
       currentCenter: room.gameCenter,
       nextRadius: null,
       nextCenter: null,
@@ -115,10 +115,11 @@ function getShrinkState(room) {
     currentCenter = currentPhaseInfo.endZone.center;
   }
 
+  const scale = Number(room.powerZoneScale || 1);
   return {
-    currentRadius,
+    currentRadius: currentRadius * scale,
     currentCenter,
-    nextRadius: currentPhaseInfo.endZone.radius,
+    nextRadius: currentPhaseInfo.endZone.radius * scale,
     nextCenter: currentPhaseInfo.endZone.center,
     phaseEndsAt: room.huntStartedAt + currentPhaseInfo.endTime,
     shrinkStartsAt: room.huntStartedAt + shrinkStartTime,
@@ -215,6 +216,9 @@ function syncJamCircles(room) {
       continue;
     }
     if (p.lat == null || p.lng == null) continue;
+    if (p.invisUntil != null && Date.now() < p.invisUntil) {
+      continue;
+    }
     if (!isInsideGameZone(p.lat, p.lng, room)) {
       p.jamCircleCenter = null;
       p.jamAnchorLat = null;
@@ -920,12 +924,19 @@ export function createRoomsStore({
       jamAnchorLat: null,
       jamAnchorLng: null,
       coins: 0,
+      invisUntil: null,
+      invisFrozenLat: null,
+      invisFrozenLng: null,
+      movementLockedUntil: null,
+      outOfBoundsOverrideUntil: null,
+      powerCooldowns: {},
     };
+    const settings = defaultSettings();
     const room = {
       code,
       hostId: socketId,
       phase: "lobby",
-      settings: defaultSettings(),
+      settings,
       gameCenter: null,
       catMapUnlockAt: null,
       players: new Map([[socketId, player]]),
@@ -933,6 +944,23 @@ export function createRoomsStore({
       partyChat: [],
       balises: [],
       lastBaliseSpawnAt: null,
+      powerZoneScale: 1,
+      powerZoneRaisedByPlayers: false,
+      powerZoneMorphCatUses: 0,
+      powerCosts: {
+        noise: 20,
+        invisibility_self: 40,
+        invisibility_single: 70,
+        invisibility_all_role: 130,
+        zone_morph_player: 120,
+        zone_morph_cat: 100,
+        no_boundaries: 80,
+        freeze_cats_single: 45,
+        freeze_cats_multi: 80,
+        freeze_cats_all: 140,
+      },
+      jamRadiusBaseM: Number(settings.jamRadiusM || 80),
+      jamRadiusScale: 1,
     };
     rooms.set(code, room);
     socketToRoom.set(socketId, code);
@@ -1007,6 +1035,12 @@ export function createRoomsStore({
       jamAnchorLat: null,
       jamAnchorLng: null,
       coins: 0,
+      invisUntil: null,
+      invisFrozenLat: null,
+      invisFrozenLng: null,
+      movementLockedUntil: null,
+      outOfBoundsOverrideUntil: null,
+      powerCooldowns: {},
     };
     room.players.set(socketId, player);
     socketToRoom.set(socketId, room.code);
@@ -1375,6 +1409,10 @@ export function createRoomsStore({
   if (!p) {
     return null;
   }
+  // If immobilized, ignore movement while lock is active
+  if (p.movementLockedUntil != null && Date.now() < p.movementLockedUntil) {
+    return { room, player: p };
+  }
   const la = Number(lat);
   const lo = Number(lng);
   if (!Number.isFinite(la) || !Number.isFinite(lo)) {
@@ -1387,7 +1425,10 @@ export function createRoomsStore({
   // Check out of bounds status changes
   if (room.phase === "playing" && !p.spectator && !p.captured && room.gameCenter) {
     const wasOutOfBounds = p.lat != null && p.lng != null ? !isInsideGameZone(p.lat, p.lng, room) : false;
-    const isNowOutOfBounds = !isInsideGameZone(la, lo, room);
+    let isNowOutOfBounds = !isInsideGameZone(la, lo, room);
+    if (p.outOfBoundsOverrideUntil != null && Date.now() < p.outOfBoundsOverrideUntil) {
+      isNowOutOfBounds = false;
+    }
     
     if (!wasOutOfBounds && isNowOutOfBounds) {
       p.justWentOutOfBounds = true;
@@ -1436,6 +1477,7 @@ export function createRoomsStore({
   }
 
   function buildRoster(room, io) {
+    const now = Date.now();
     return [...room.players.values()].map((p) => ({
       sessionId: p.sessionId,
       nickname: p.nickname,
@@ -1444,6 +1486,8 @@ export function createRoomsStore({
       captured: p.captured,
       spectator: p.spectator,
       disconnected: io ? isDisconnectedGhost(p, io) : false,
+      invisible: p.invisUntil != null && now < p.invisUntil,
+      coins: p.coins || 0,
     }));
   }
 
@@ -1484,6 +1528,9 @@ export function createRoomsStore({
         gameMode: room.settings.gameMode || "tag_swap",
         hostCatMapPreview: Boolean(room.settings.hostCatMapPreview),
       },
+      jamRadiusBaseM: Number(room.jamRadiusBaseM || jamRadiusM || 80),
+      jamRadiusScale: Number(room.jamRadiusScale || 1),
+      powerCosts: room.powerCosts || null,
       gameCenter: center,
       effectiveGlobalCenter,
       effectiveGlobalRadiusM,
@@ -1508,13 +1555,26 @@ export function createRoomsStore({
         nickname: viewer.nickname,
         role: viewer.role,
         originalRole: viewer.originalRole,
-        lat: viewer.lat,
-        lng: viewer.lng,
+        // When invisible, only expose the frozen position to the client (last known point)
+        lat:
+          viewer.invisUntil != null && Date.now() < viewer.invisUntil &&
+          viewer.invisFrozenLat != null
+            ? viewer.invisFrozenLat
+            : viewer.lat,
+        lng:
+          viewer.invisUntil != null && Date.now() < viewer.invisUntil &&
+          viewer.invisFrozenLng != null
+            ? viewer.invisFrozenLng
+            : viewer.lng,
         captured: viewer.captured,
         spectator: viewer.spectator,
         coins: viewer.coins || 0,
         catTimeMs: (viewer.catTimeMs || 0) + (viewer.role === "cat" && viewer.catSince ? Date.now() - viewer.catSince : 0),
         outOfBounds: viewer.lat != null && viewer.lng != null ? !isInsideGameZone(viewer.lat, viewer.lng, room) : false,
+        immobilizedUntil: viewer.movementLockedUntil || null,
+        invisUntil: viewer.invisUntil || null,
+        outOfBoundsOverrideUntil: viewer.outOfBoundsOverrideUntil || null,
+        powerCooldowns: viewer.powerCooldowns || {},
       },
       myJamCircle: null,
       allies: [],
@@ -1544,6 +1604,7 @@ export function createRoomsStore({
       };
     }
 
+    const now = Date.now();
     for (const p of others) {
       if (p.spectator || p.captured) {
         payload.spectators.push({
@@ -1557,14 +1618,18 @@ export function createRoomsStore({
 
       if (viewer.spectator || viewer.captured) {
         if (p.lat == null || p.lng == null) continue;
+        const invisActive = p.invisUntil != null && now < p.invisUntil;
+        const lat = invisActive && p.invisFrozenLat != null ? p.invisFrozenLat : p.lat;
+        const lng = invisActive && p.invisFrozenLng != null ? p.invisFrozenLng : p.lng;
         payload.allies.push({
           sessionId: p.sessionId,
           nickname: p.nickname,
           role: p.role,
-          lat: p.lat,
-          lng: p.lng,
+          lat,
+          lng,
           disconnected: isDisconnectedGhost(p, io),
           outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
+          invisible: invisActive,
         });
         continue;
       }
@@ -1582,48 +1647,75 @@ export function createRoomsStore({
           });
         } else if (p.role === "player") {
           if (p.lat == null || p.lng == null) continue;
-          const inside = isInsideGameZone(p.lat, p.lng, room);
           const disc = isDisconnectedGhost(p, io);
-          if (!inside) {
-            payload.preyForCat.push({
-              sessionId: p.sessionId,
-              nickname: p.nickname,
-              kind: "exact",
-              lat: p.lat,
-              lng: p.lng,
-              disconnected: disc,
-              outOfBounds: true,
-            });
-          } else if (p.jamCircleCenter) {
+          const invisActive = p.invisUntil != null && now < p.invisUntil;
+          if (invisActive) {
+            // Invisible prey: cats only see a greyed jam circle with a ghost, not the exact point
+            const center =
+              p.jamCircleCenter ||
+              (p.invisFrozenLat != null && p.invisFrozenLng != null
+                ? { lat: p.invisFrozenLat, lng: p.invisFrozenLng }
+                : { lat: p.lat, lng: p.lng });
             payload.preyForCat.push({
               sessionId: p.sessionId,
               nickname: p.nickname,
               kind: "circle",
-              center: p.jamCircleCenter,
+              center,
               radiusM: jamRadiusM,
               disconnected: disc,
+              invisible: true,
             });
+          } else {
+            const inside = isInsideGameZone(p.lat, p.lng, room);
+            if (!inside) {
+              payload.preyForCat.push({
+                sessionId: p.sessionId,
+                nickname: p.nickname,
+                kind: "exact",
+                lat: p.lat,
+                lng: p.lng,
+                disconnected: disc,
+                outOfBounds: true,
+              });
+            } else if (p.jamCircleCenter) {
+              payload.preyForCat.push({
+                sessionId: p.sessionId,
+                nickname: p.nickname,
+                kind: "circle",
+                center: p.jamCircleCenter,
+                radiusM: jamRadiusM,
+                disconnected: disc,
+              });
+            }
           }
         }
       } else if (viewer.role === "player") {
         if (p.role === "player") {
           if (p.lat == null || p.lng == null) continue;
+          const invisActive = p.invisUntil != null && now < p.invisUntil;
+          const lat = invisActive && p.invisFrozenLat != null ? p.invisFrozenLat : p.lat;
+          const lng = invisActive && p.invisFrozenLng != null ? p.invisFrozenLng : p.lng;
           payload.allies.push({
             sessionId: p.sessionId,
             nickname: p.nickname,
-            lat: p.lat,
-            lng: p.lng,
+            lat,
+            lng,
             disconnected: isDisconnectedGhost(p, io),
+            invisible: invisActive,
           });
         } else if (p.role === "cat") {
           if (p.lat == null || p.lng == null) continue;
+          const invisActive = p.invisUntil != null && now < p.invisUntil;
+          const lat = invisActive && p.invisFrozenLat != null ? p.invisFrozenLat : p.lat;
+          const lng = invisActive && p.invisFrozenLng != null ? p.invisFrozenLng : p.lng;
           payload.catsExact.push({
             sessionId: p.sessionId,
             nickname: p.nickname,
-            lat: p.lat,
-            lng: p.lng,
+            lat,
+            lng,
             disconnected: isDisconnectedGhost(p, io),
             outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
+            invisible: invisActive,
           });
         }
       }
@@ -2049,6 +2141,12 @@ export function createRoomsStore({
       jamAnchorLat: null,
       jamAnchorLng: null,
       coins: 0,
+      invisUntil: null,
+      invisFrozenLat: null,
+      invisFrozenLng: null,
+      movementLockedUntil: null,
+      outOfBoundsOverrideUntil: null,
+      powerCooldowns: {},
     };
     room.players.set(pending.socketId, player);
     socketToRoom.set(pending.socketId, room.code);
@@ -2160,6 +2258,303 @@ export function createRoomsStore({
     return { ok: true, entry };
   }
 
+  function usePower(io, socketId, body) {
+    const code = socketToRoom.get(socketId);
+    if (!code) return { error: "Pas dans une salle." };
+    const room = rooms.get(code);
+    if (!room || room.phase !== "playing") return { error: "Pas de partie en cours." };
+    const actor = room.players.get(socketId);
+    if (!actor || actor.spectator) return { error: "Action non autorisée." };
+    const kind = String(body?.kind || "").toLowerCase();
+    const now = Date.now();
+
+    const ensureCoins = (p, cost) => {
+      if ((p.coins || 0) < cost) return false;
+      p.coins = (p.coins || 0) - cost;
+      return true;
+    };
+    const findBySessionId = (sid) => {
+      for (const p of room.players.values()) if (p.sessionId === sid) return p;
+      return null;
+    };
+    const onCooldown = (p, key) => Number(p.powerCooldowns?.[key] || 0) > now;
+    const setCooldown = (p, key, secs) => {
+      if (!p.powerCooldowns) p.powerCooldowns = {};
+      const until = now + Math.max(0, Math.floor(secs)) * 1000;
+      p.powerCooldowns[key] = until;
+      return until;
+    };
+
+    if (kind === "noise") {
+      // Multiple targets, duration presets and volume all influence the cost
+      const baseCost = Number(room.powerCosts?.noise || 20);
+
+      let targetIds = [];
+      if (Array.isArray(body?.targetSessionIds) && body.targetSessionIds.length > 0) {
+        targetIds = body.targetSessionIds.map((id) => String(id));
+      } else if (body?.targetSessionId) {
+        targetIds = [String(body.targetSessionId)];
+      }
+      const targets = targetIds
+        .map((sid) => findBySessionId(sid))
+        .filter((t) => t && t.sessionId !== actor.sessionId);
+      if (!targets.length) return { error: "Cible introuvable." };
+
+      let durationSec = Number(body?.durationSec) || 30;
+      if (durationSec <= 10) durationSec = 10;
+      else if (durationSec >= 60) durationSec = 60;
+      else durationSec = 30;
+
+      const volRaw = String(body?.volume || "medium");
+      const volume = volRaw === "low" || volRaw === "high" ? volRaw : "medium";
+
+      const durationFactor = durationSec === 10 ? 0.5 : durationSec === 60 ? 1.8 : 1.0;
+      const volumeFactor = volume === "low" ? 0.7 : volume === "high" ? 1.4 : 1.0;
+      const count = targets.length;
+      const rawCost = baseCost * durationFactor * volumeFactor * count;
+      const cost = Math.max(1, Math.ceil(rawCost));
+
+      if (onCooldown(actor, "noise")) return { error: "Bruit en recharge." };
+      if (!ensureCoins(actor, cost)) return { error: "Pas assez de pièces." };
+
+      for (const t of targets) {
+        const sock = io.sockets.sockets.get(t.socketId);
+        sock?.emit("play_noise", { durationSec, volume, by: actor.nickname });
+      }
+
+      pushTimeline(room, {
+        type: "power_noise",
+        bySessionId: actor.sessionId,
+        targetSessionIds: targets.map((t) => t.sessionId),
+        durationSec,
+        volume,
+        cost,
+      });
+      setCooldown(actor, "noise", 60);
+      broadcastPlayingState(io, room);
+      return { ok: true };
+    }
+
+    if (kind === "invisibility") {
+      const scope = String(body?.scope || "self"); // self | single | multi | all_role
+      const durationSec = Math.max(30, Math.min(900, Number(body?.durationSec) || 300));
+      const until = now + durationSec * 1000;
+      let targets = [];
+      if (scope === "self") targets = [actor];
+      else if (scope === "single") {
+        const sid = String(body?.targetSessionId || "");
+        const t = findBySessionId(sid);
+        if (!t) return { error: "Cible introuvable." };
+        targets = [t];
+      } else if (scope === "multi") {
+        const ids = Array.isArray(body?.targetSessionIds) ? body.targetSessionIds : [];
+        targets = ids.map(findBySessionId).filter(Boolean);
+      } else if (scope === "all_role") {
+        targets = [...room.players.values()].filter((p) => p.role === actor.role && !p.spectator);
+      } else return { error: "Portée invalide." };
+      const cost = scope === "self"
+        ? Number(room.powerCosts?.invisibility_self || 40)
+        : scope === "single" || scope === "multi"
+          ? (Number(room.powerCosts?.invisibility_single || 70) * Math.max(1, targets.length))
+          : Number(room.powerCosts?.invisibility_all_role || 130);
+      if (onCooldown(actor, "invisibility")) return { error: "Invisibilité en recharge." };
+      if (!ensureCoins(actor, cost)) return { error: "Pas assez de pièces." };
+      for (const t of targets) {
+        t.invisUntil = until;
+        t.invisFrozenLat = t.lat;
+        t.invisFrozenLng = t.lng;
+      }
+      pushTimeline(room, { type: "power_invisibility", bySessionId: actor.sessionId, scope, count: targets.length, durationSec });
+      setCooldown(actor, "invisibility", 120);
+      broadcastPlayingState(io, room);
+      return { ok: true };
+    }
+
+    if (kind === "zone_morph") {
+      // This power only affects the jam radius (players' blur circles)
+      if (!room.jamRadiusBaseM) {
+        room.jamRadiusBaseM = Number(room.settings.jamRadiusM) || 80;
+      }
+      if (typeof room.jamRadiusScale !== "number" || !Number.isFinite(room.jamRadiusScale)) {
+        room.jamRadiusScale = 1;
+      }
+
+      const baseJam = room.jamRadiusBaseM;
+      const minScale = 0.5;
+      const maxScale = 1.5;
+      const step = 0.5;
+      const currentScale = Math.min(maxScale, Math.max(minScale, Number(room.jamRadiusScale || 1)));
+
+      if (actor.role === "player") {
+        const baseCost = Number(room.powerCosts?.zone_morph_player || 120);
+        const doubleCost = baseCost * 2;
+
+        let targetScale = currentScale;
+        let usedDouble = false;
+
+        // Players always move the scale upwards (towards maxScale)
+        if (currentScale <= minScale + 1e-6) {
+          // Extremely small -> try double jump to maxScale if enough coins
+          if (!ensureCoins(actor, doubleCost)) return { error: "Pas assez de pièces." };
+          targetScale = maxScale;
+          usedDouble = true;
+        } else if (currentScale < maxScale - 1e-6) {
+          if (!ensureCoins(actor, baseCost)) return { error: "Pas assez de pièces." };
+          targetScale = Math.min(maxScale, currentScale + step);
+        } else {
+          return { error: "Déjà au maximum." };
+        }
+
+        room.jamRadiusScale = targetScale;
+        room.settings.jamRadiusM = Math.round(baseJam * targetScale);
+
+        pushTimeline(room, {
+          type: "power_zone_jam_player",
+          bySessionId: actor.sessionId,
+          scale: targetScale,
+          baseJam,
+          jamRadiusM: room.settings.jamRadiusM,
+          double: usedDouble,
+        });
+        broadcastPlayingState(io, room);
+        return { ok: true };
+      } else if (actor.role === "cat") {
+        const baseCost = Number(room.powerCosts?.zone_morph_cat || 100);
+        const doubleCost = baseCost * 2;
+
+        let targetScale = currentScale;
+        let usedDouble = false;
+
+        // Cats always move the scale downwards (towards minScale)
+        if (currentScale >= maxScale - 1e-6) {
+          // Extremely large -> try double jump to minScale if enough coins
+          if (!ensureCoins(actor, doubleCost)) return { error: "Pas assez de pièces." };
+          targetScale = minScale;
+          usedDouble = true;
+        } else if (currentScale > minScale + 1e-6) {
+          if (!ensureCoins(actor, baseCost)) return { error: "Pas assez de pièces." };
+          targetScale = Math.max(minScale, currentScale - step);
+        } else {
+          return { error: "Déjà au minimum." };
+        }
+
+        room.jamRadiusScale = targetScale;
+        room.settings.jamRadiusM = Math.round(baseJam * targetScale);
+
+        pushTimeline(room, {
+          type: "power_zone_jam_cat",
+          bySessionId: actor.sessionId,
+          scale: targetScale,
+          baseJam,
+          jamRadiusM: room.settings.jamRadiusM,
+          double: usedDouble,
+        });
+        broadcastPlayingState(io, room);
+        return { ok: true };
+      }
+      return { error: "Rôle invalide." };
+    }
+
+    if (kind === "no_boundaries") {
+      if (actor.role !== "player") return { error: "Réservé aux joueurs." };
+      // Verrouiller ce pouvoir au tout début de la partie
+      const minElapsedMs = 5 * 60 * 1000; // 5 minutes
+      if (!room.huntStartedAt || Date.now() - room.huntStartedAt < minElapsedMs) {
+        return { error: "Disponible plus tard dans la partie." };
+      }
+      if (onCooldown(actor, "no_boundaries")) return { error: "Recharge en cours." };
+      if (!ensureCoins(actor, Number(room.powerCosts?.no_boundaries || 80))) return { error: "Pas assez de pièces." };
+      const durationSec = Math.max(60, Math.min(1800, Number(body?.durationSec) || 600));
+      actor.outOfBoundsOverrideUntil = now + durationSec * 1000;
+      pushTimeline(room, { type: "power_no_boundaries", bySessionId: actor.sessionId, durationSec });
+      setCooldown(actor, "no_boundaries", 300);
+      broadcastPlayingState(io, room);
+      return { ok: true };
+    }
+
+    if (kind === "freeze_cats") {
+      if (actor.role !== "player") return { error: "Réservé aux joueurs." };
+      const scope = String(body?.scope || "single"); // single | multi | all
+      const durationSec = Math.max(5, Math.min(120, Number(body?.durationSec) || 20));
+      let targets = [];
+      if (scope === "single") {
+        const sid = String(body?.targetSessionId || "");
+        const t = findBySessionId(sid);
+        if (!t) return { error: "Cible introuvable." };
+        targets = [t];
+      } else if (scope === "multi") {
+        const ids = Array.isArray(body?.targetSessionIds) ? body.targetSessionIds : [];
+        targets = ids.map(findBySessionId).filter(Boolean);
+      } else if (scope === "all") {
+        targets = [...room.players.values()].filter((p) => p.sessionId !== actor.sessionId && !p.spectator);
+      } else return { error: "Portée invalide." };
+      const cost = scope === "single"
+        ? Number(room.powerCosts?.freeze_cats_single || 45)
+        : scope === "multi"
+          ? Number(room.powerCosts?.freeze_cats_multi || 80)
+          : Number(room.powerCosts?.freeze_cats_all || 140);
+      if (onCooldown(actor, "freeze_cats")) return { error: "Recharge en cours." };
+      if (!ensureCoins(actor, cost)) return { error: "Pas assez de pièces." };
+      const until = now + durationSec * 1000;
+      for (const t of targets) {
+        t.movementLockedUntil = Math.max(Number(t.movementLockedUntil || 0), until);
+        const sock = io.sockets.sockets.get(t.socketId);
+        sock?.emit("immobilized", { until, by: actor.nickname, durationSec });
+      }
+      pushTimeline(room, { type: "power_freeze_cats", bySessionId: actor.sessionId, scope, count: targets.length, durationSec });
+      setCooldown(actor, "freeze_cats", 90);
+      broadcastPlayingState(io, room);
+      return { ok: true };
+    }
+
+    return { error: "Pouvoir inconnu." };
+  }
+
+  function adminSetPowerCosts(io, socketId, partialCosts) {
+    const code = socketToRoom.get(socketId);
+    if (!code) return { error: "Pas dans une salle." };
+    const room = rooms.get(code);
+    if (!room || room.hostId !== socketId) return { error: "Hôte requis." };
+    const pc = room.powerCosts || {};
+    const valid = [
+      "noise",
+      "invisibility_self",
+      "invisibility_single",
+      "invisibility_all_role",
+      "zone_morph_player",
+      "zone_morph_cat",
+      "no_boundaries",
+      "freeze_cats_single",
+      "freeze_cats_multi",
+      "freeze_cats_all",
+    ];
+    for (const k of valid) {
+      if (partialCosts && partialCosts[k] != null) {
+        const v = Number(partialCosts[k]);
+        if (Number.isFinite(v) && v >= 0 && v <= 100000) pc[k] = Math.floor(v);
+      }
+    }
+    room.powerCosts = pc;
+    broadcastPlayingState(io, room);
+    return { ok: true };
+  }
+
+  function adminAdjustCoins(io, socketId, targetSessionId, delta) {
+    const code = socketToRoom.get(socketId);
+    if (!code) return { error: "Pas dans une salle." };
+    const room = rooms.get(code);
+    if (!room || room.hostId !== socketId) return { error: "Hôte requis." };
+    let target = null;
+    for (const p of room.players.values()) if (p.sessionId === targetSessionId) { target = p; break; }
+    if (!target) return { error: "Cible introuvable." };
+    const d = Math.floor(Number(delta || 0));
+    if (!Number.isFinite(d)) return { error: "Delta invalide." };
+    target.coins = Math.max(0, (target.coins || 0) + d);
+    pushTimeline(room, { type: "admin_adjust_coins", bySessionId: room.players.get(room.hostId)?.sessionId, targetSessionId, delta: d });
+    broadcastPlayingState(io, room);
+    return { ok: true, coins: target.coins };
+  }
+
   function leaveRoomVoluntarily(io, socketId) {
     const code = socketToRoom.get(socketId);
     if (!code) return { error: "Pas dans une salle." };
@@ -2243,5 +2638,8 @@ export function createRoomsStore({
     recordPlayerTimelineReconnect,
     partyChatSend,
     updateBalises,
+    usePower,
+    adminSetPowerCosts,
+    adminAdjustCoins,
   };
 }
