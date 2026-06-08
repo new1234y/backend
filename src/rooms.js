@@ -402,8 +402,23 @@ async function spawnBalise(room) {
   const effectiveRadius = shrink.currentRadius || getEffectiveGlobalRadius(room);
   const radiusFactor = 0.04 + Math.random() * 0.04;
   const baliseRadiusM = Math.max(18, Math.min(55, Math.round(effectiveRadius * radiusFactor)));
-  const position = await pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM) ||
-    pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM);
+
+  let position = null;
+  // Si un chat a programmé une balise-leurre, on l'utilise pour la prochaine balise uniquement
+  if (room.nextBaliseOverride &&
+      Number.isFinite(room.nextBaliseOverride.lat) &&
+      Number.isFinite(room.nextBaliseOverride.lng)) {
+    position = {
+      lat: Number(room.nextBaliseOverride.lat),
+      lng: Number(room.nextBaliseOverride.lng),
+      source: "override_cat",
+      osmWayId: null,
+    };
+    room.nextBaliseOverride = null;
+  } else {
+    position = await pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM) ||
+      pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM);
+  }
   
   // Remove all existing balises (only one active at a time)
   room.balises = [];
@@ -414,7 +429,7 @@ async function spawnBalise(room) {
     lng: position.lng,
     radiusM: baliseRadiusM,
     visualScale: Number((baliseRadiusM / 30).toFixed(2)),
-    placementHint: position.source === "osm" ? "osm_pedestrian_way" : "fallback_random",
+    placementHint: position.source === "osm" ? "osm_pedestrian_way" : position.source || "fallback_random",
     osmWayId: position.osmWayId || null,
     createdAt: Date.now(),
     expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes lifetime
@@ -925,6 +940,7 @@ export function createRoomsStore({
       jamAnchorLng: null,
       coins: 0,
       invisUntil: null,
+      invisSince: null,
       invisFrozenLat: null,
       invisFrozenLng: null,
       movementLockedUntil: null,
@@ -944,6 +960,7 @@ export function createRoomsStore({
       partyChat: [],
       balises: [],
       lastBaliseSpawnAt: null,
+      nextBaliseOverride: null,
       powerZoneScale: 1,
       powerZoneRaisedByPlayers: false,
       powerZoneMorphCatUses: 0,
@@ -958,6 +975,11 @@ export function createRoomsStore({
         freeze_cats_single: 45,
         freeze_cats_multi: 80,
         freeze_cats_all: 140,
+        balise_leurre: 60,
+      },
+      powerUses: {}, // { [sessionId]: { [powerKey]: count } }
+      powerMaxUses: {
+        balise_leurre: 1,
       },
       jamRadiusBaseM: Number(settings.jamRadiusM || 80),
       jamRadiusScale: 1,
@@ -1036,6 +1058,7 @@ export function createRoomsStore({
       jamAnchorLng: null,
       coins: 0,
       invisUntil: null,
+      invisSince: null,
       invisFrozenLat: null,
       invisFrozenLng: null,
       movementLockedUntil: null,
@@ -1478,17 +1501,23 @@ export function createRoomsStore({
 
   function buildRoster(room, io) {
     const now = Date.now();
-    return [...room.players.values()].map((p) => ({
-      sessionId: p.sessionId,
-      nickname: p.nickname,
-      role: p.role,
-      originalRole: p.originalRole,
-      captured: p.captured,
-      spectator: p.spectator,
-      disconnected: io ? isDisconnectedGhost(p, io) : false,
-      invisible: p.invisUntil != null && now < p.invisUntil,
-      coins: p.coins || 0,
-    }));
+    return [...room.players.values()].map((p) => {
+      const invisible = p.invisUntil != null && now < p.invisUntil;
+      return {
+        sessionId: p.sessionId,
+        nickname: p.nickname,
+        role: p.role,
+        originalRole: p.originalRole,
+        captured: p.captured,
+        spectator: p.spectator,
+        disconnected: io ? isDisconnectedGhost(p, io) : false,
+        invisible,
+        // Informations supplémentaires pour l'UI ghost (barre de temps restante)
+        invisUntil: invisible ? p.invisUntil : null,
+        invisSince: invisible ? p.invisSince : null,
+        coins: p.coins || 0,
+      };
+    });
   }
 
   function buildPlayingPayloadForSocket(room, viewerSocketId, io) {
@@ -1555,17 +1584,9 @@ export function createRoomsStore({
         nickname: viewer.nickname,
         role: viewer.role,
         originalRole: viewer.originalRole,
-        // When invisible, only expose the frozen position to the client (last known point)
-        lat:
-          viewer.invisUntil != null && Date.now() < viewer.invisUntil &&
-          viewer.invisFrozenLat != null
-            ? viewer.invisFrozenLat
-            : viewer.lat,
-        lng:
-          viewer.invisUntil != null && Date.now() < viewer.invisUntil &&
-          viewer.invisFrozenLng != null
-            ? viewer.invisFrozenLng
-            : viewer.lng,
+        // En mode ghost (invisible), on laisse le joueur voir sa propre position
+        lat: viewer.lat,
+        lng: viewer.lng,
         captured: viewer.captured,
         spectator: viewer.spectator,
         coins: viewer.coins || 0,
@@ -1573,6 +1594,7 @@ export function createRoomsStore({
         outOfBounds: viewer.lat != null && viewer.lng != null ? !isInsideGameZone(viewer.lat, viewer.lng, room) : false,
         immobilizedUntil: viewer.movementLockedUntil || null,
         invisUntil: viewer.invisUntil || null,
+        invisSince: viewer.invisSince || null,
         outOfBoundsOverrideUntil: viewer.outOfBoundsOverrideUntil || null,
         powerCooldowns: viewer.powerCooldowns || {},
       },
@@ -1585,16 +1607,20 @@ export function createRoomsStore({
       partyChat: [...(room.partyChat || [])].slice(-80),
       balises: room.balises || [],
       nextBaliseAt: room.lastBaliseSpawnAt ? room.lastBaliseSpawnAt + 5 * 60 * 1000 : null,
+      powerLimits: room.powerMaxUses || {},
+      powerUses: room.powerUses?.[viewer.sessionId] || {},
     };
 
     if (catMapLocked) {
       return payload;
     }
 
+    const viewerInvisActive = viewer.invisUntil != null && Date.now() < viewer.invisUntil;
     if (
       viewer.role === "player" &&
       !viewer.spectator &&
       !viewer.captured &&
+      !viewerInvisActive &&
       viewer.jamCircleCenter &&
       viewer.lat != null
     ) {
@@ -1619,17 +1645,17 @@ export function createRoomsStore({
       if (viewer.spectator || viewer.captured) {
         if (p.lat == null || p.lng == null) continue;
         const invisActive = p.invisUntil != null && now < p.invisUntil;
-        const lat = invisActive && p.invisFrozenLat != null ? p.invisFrozenLat : p.lat;
-        const lng = invisActive && p.invisFrozenLng != null ? p.invisFrozenLng : p.lng;
+        // En mode ghost, on ne montre plus la position sur la carte
+        if (invisActive) continue;
         payload.allies.push({
           sessionId: p.sessionId,
           nickname: p.nickname,
           role: p.role,
-          lat,
-          lng,
+          lat: p.lat,
+          lng: p.lng,
           disconnected: isDisconnectedGhost(p, io),
           outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
-          invisible: invisActive,
+          invisible: false,
         });
         continue;
       }
@@ -1637,6 +1663,8 @@ export function createRoomsStore({
       if (viewer.role === "cat") {
         if (p.role === "cat") {
           if (p.lat == null || p.lng == null) continue;
+          const invisActive = p.invisUntil != null && now < p.invisUntil;
+          if (invisActive) continue;
           payload.catsExact.push({
             sessionId: p.sessionId,
             nickname: p.nickname,
@@ -1650,21 +1678,8 @@ export function createRoomsStore({
           const disc = isDisconnectedGhost(p, io);
           const invisActive = p.invisUntil != null && now < p.invisUntil;
           if (invisActive) {
-            // Invisible prey: cats only see a greyed jam circle with a ghost, not the exact point
-            const center =
-              p.jamCircleCenter ||
-              (p.invisFrozenLat != null && p.invisFrozenLng != null
-                ? { lat: p.invisFrozenLat, lng: p.invisFrozenLng }
-                : { lat: p.lat, lng: p.lng });
-            payload.preyForCat.push({
-              sessionId: p.sessionId,
-              nickname: p.nickname,
-              kind: "circle",
-              center,
-              radiusM: jamRadiusM,
-              disconnected: disc,
-              invisible: true,
-            });
+            // Invisible prey fully hidden from cats
+            continue;
           } else {
             const inside = isInsideGameZone(p.lat, p.lng, room);
             if (!inside) {
@@ -1693,29 +1708,30 @@ export function createRoomsStore({
         if (p.role === "player") {
           if (p.lat == null || p.lng == null) continue;
           const invisActive = p.invisUntil != null && now < p.invisUntil;
-          const lat = invisActive && p.invisFrozenLat != null ? p.invisFrozenLat : p.lat;
-          const lng = invisActive && p.invisFrozenLng != null ? p.invisFrozenLng : p.lng;
+          if (invisActive) continue;
           payload.allies.push({
             sessionId: p.sessionId,
             nickname: p.nickname,
-            lat,
-            lng,
+            lat: p.lat,
+            lng: p.lng,
             disconnected: isDisconnectedGhost(p, io),
-            invisible: invisActive,
+            invisible: false,
           });
         } else if (p.role === "cat") {
           if (p.lat == null || p.lng == null) continue;
           const invisActive = p.invisUntil != null && now < p.invisUntil;
-          const lat = invisActive && p.invisFrozenLat != null ? p.invisFrozenLat : p.lat;
-          const lng = invisActive && p.invisFrozenLng != null ? p.invisFrozenLng : p.lng;
+          if (invisActive) {
+            // On ne montre pas non plus les chats en ghost
+            continue;
+          }
           payload.catsExact.push({
             sessionId: p.sessionId,
             nickname: p.nickname,
-            lat,
-            lng,
+            lat: p.lat,
+            lng: p.lng,
             disconnected: isDisconnectedGhost(p, io),
             outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
-            invisible: invisActive,
+            invisible: false,
           });
         }
       }
@@ -2142,6 +2158,7 @@ export function createRoomsStore({
       jamAnchorLng: null,
       coins: 0,
       invisUntil: null,
+      invisSince: null,
       invisFrozenLat: null,
       invisFrozenLng: null,
       movementLockedUntil: null,
@@ -2285,6 +2302,49 @@ export function createRoomsStore({
       return until;
     };
 
+    const incPowerUse = (p, key) => {
+      if (!room.powerUses) room.powerUses = {};
+      if (!room.powerUses[p.sessionId]) room.powerUses[p.sessionId] = {};
+      const current = Number(room.powerUses[p.sessionId][key] || 0);
+      room.powerUses[p.sessionId][key] = current + 1;
+      return room.powerUses[p.sessionId][key];
+    };
+    const getPowerUses = (p, key) => {
+      return Number(room.powerUses?.[p.sessionId]?.[key] || 0);
+    };
+
+    if (kind === "balise_leurre") {
+      // Pouvoir spécial de chat : programmer la prochaine balise comme un leurre
+      if (actor.role !== "cat") return { error: "Réservé aux chats." };
+      const maxUses = Number(room.powerMaxUses?.balise_leurre || 1);
+      const used = getPowerUses(actor, "balise_leurre");
+      if (used >= maxUses) return { error: "Pouvoir déjà utilisé." };
+
+      const lat = Number(body?.lat);
+      const lng = Number(body?.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return { error: "Coordonnées invalides." };
+      }
+
+      // Vérifier que la position est dans la zone de jeu
+      if (!isInsideGameZone(lat, lng, room)) {
+        return { error: "Position hors de la zone de jeu." };
+      }
+
+      const cost = Number(room.powerCosts?.balise_leurre || 60);
+      if (!ensureCoins(actor, cost)) return { error: "Pas assez de pièces." };
+
+      room.nextBaliseOverride = {
+        lat,
+        lng,
+        bySessionId: actor.sessionId,
+      };
+
+      incPowerUse(actor, "balise_leurre");
+      broadcastPlayingState(io, room);
+      return { ok: true };
+    }
+
     if (kind === "noise") {
       // Multiple targets, duration presets and volume all influence the cost
       const baseCost = Number(room.powerCosts?.noise || 20);
@@ -2339,6 +2399,7 @@ export function createRoomsStore({
       const scope = String(body?.scope || "self"); // self | single | multi | all_role
       const durationSec = Math.max(30, Math.min(900, Number(body?.durationSec) || 300));
       const until = now + durationSec * 1000;
+      const durationFactor = Math.pow(durationSec / 300, 1.6); // 5 minutes = coût de base
       let targets = [];
       if (scope === "self") targets = [actor];
       else if (scope === "single") {
@@ -2352,20 +2413,43 @@ export function createRoomsStore({
       } else if (scope === "all_role") {
         targets = [...room.players.values()].filter((p) => p.role === actor.role && !p.spectator);
       } else return { error: "Portée invalide." };
-      const cost = scope === "self"
-        ? Number(room.powerCosts?.invisibility_self || 40)
-        : scope === "single" || scope === "multi"
-          ? (Number(room.powerCosts?.invisibility_single || 70) * Math.max(1, targets.length))
-          : Number(room.powerCosts?.invisibility_all_role || 130);
+
+      let cost = 0;
+      if (scope === "self") {
+        const base = Number(room.powerCosts?.invisibility_self || 40);
+        cost = Math.max(1, Math.round(base * durationFactor));
+      } else if (scope === "single" || scope === "multi") {
+        const base = Number(room.powerCosts?.invisibility_single || 70);
+        const perTarget = Math.max(1, Math.round(base * durationFactor));
+        cost = perTarget * Math.max(1, targets.length);
+      } else {
+        const base = Number(room.powerCosts?.invisibility_all_role || 130);
+        cost = Math.max(1, Math.round(base * durationFactor));
+      }
       if (onCooldown(actor, "invisibility")) return { error: "Invisibilité en recharge." };
       if (!ensureCoins(actor, cost)) return { error: "Pas assez de pièces." };
       for (const t of targets) {
         t.invisUntil = until;
+        t.invisSince = now;
         t.invisFrozenLat = t.lat;
         t.invisFrozenLng = t.lng;
       }
       pushTimeline(room, { type: "power_invisibility", bySessionId: actor.sessionId, scope, count: targets.length, durationSec });
       setCooldown(actor, "invisibility", 120);
+      broadcastPlayingState(io, room);
+      return { ok: true };
+    }
+
+    if (kind === "invisibility_cancel") {
+      // Permet à un joueur de quitter le mode ghost plus tôt, sans coût
+      if (!actor.invisUntil || now >= actor.invisUntil) {
+        return { error: "Pas en mode ghost." };
+      }
+      actor.invisUntil = null;
+      actor.invisSince = null;
+      actor.invisFrozenLat = null;
+      actor.invisFrozenLng = null;
+      pushTimeline(room, { type: "power_invisibility_end", bySessionId: actor.sessionId });
       broadcastPlayingState(io, room);
       return { ok: true };
     }
@@ -2387,23 +2471,14 @@ export function createRoomsStore({
 
       if (actor.role === "player") {
         const baseCost = Number(room.powerCosts?.zone_morph_player || 120);
-        const doubleCost = baseCost * 2;
 
-        let targetScale = currentScale;
-        let usedDouble = false;
-
-        // Players always move the scale upwards (towards maxScale)
-        if (currentScale <= minScale + 1e-6) {
-          // Extremely small -> try double jump to maxScale if enough coins
-          if (!ensureCoins(actor, doubleCost)) return { error: "Pas assez de pièces." };
-          targetScale = maxScale;
-          usedDouble = true;
-        } else if (currentScale < maxScale - 1e-6) {
-          if (!ensureCoins(actor, baseCost)) return { error: "Pas assez de pièces." };
-          targetScale = Math.min(maxScale, currentScale + step);
-        } else {
+        // Les joueurs agrandissent le cercle palier par palier : 0.5 -> 1.0 -> 1.5
+        if (currentScale >= maxScale - 1e-6) {
           return { error: "Déjà au maximum." };
         }
+
+        if (!ensureCoins(actor, baseCost)) return { error: "Pas assez de pièces." };
+        const targetScale = Math.min(maxScale, currentScale + step);
 
         room.jamRadiusScale = targetScale;
         room.settings.jamRadiusM = Math.round(baseJam * targetScale);
@@ -2414,29 +2489,20 @@ export function createRoomsStore({
           scale: targetScale,
           baseJam,
           jamRadiusM: room.settings.jamRadiusM,
-          double: usedDouble,
+          double: false,
         });
         broadcastPlayingState(io, room);
         return { ok: true };
       } else if (actor.role === "cat") {
         const baseCost = Number(room.powerCosts?.zone_morph_cat || 100);
-        const doubleCost = baseCost * 2;
 
-        let targetScale = currentScale;
-        let usedDouble = false;
-
-        // Cats always move the scale downwards (towards minScale)
-        if (currentScale >= maxScale - 1e-6) {
-          // Extremely large -> try double jump to minScale if enough coins
-          if (!ensureCoins(actor, doubleCost)) return { error: "Pas assez de pièces." };
-          targetScale = minScale;
-          usedDouble = true;
-        } else if (currentScale > minScale + 1e-6) {
-          if (!ensureCoins(actor, baseCost)) return { error: "Pas assez de pièces." };
-          targetScale = Math.max(minScale, currentScale - step);
-        } else {
+        // Les chats réduisent le cercle palier par palier : 1.5 -> 1.0 -> 0.5
+        if (currentScale <= minScale + 1e-6) {
           return { error: "Déjà au minimum." };
         }
+
+        if (!ensureCoins(actor, baseCost)) return { error: "Pas assez de pièces." };
+        const targetScale = Math.max(minScale, currentScale - step);
 
         room.jamRadiusScale = targetScale;
         room.settings.jamRadiusM = Math.round(baseJam * targetScale);
@@ -2447,7 +2513,7 @@ export function createRoomsStore({
           scale: targetScale,
           baseJam,
           jamRadiusM: room.settings.jamRadiusM,
-          double: usedDouble,
+          double: false,
         });
         broadcastPlayingState(io, room);
         return { ok: true };
