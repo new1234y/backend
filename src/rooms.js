@@ -36,6 +36,39 @@ function randomCode(len = 5) {
   return s;
 }
 
+function calculateAdaptivePhaseCount(timeLimitMinutes, globalRadiusM) {
+  const R0 = globalRadiusM || 500;
+  const Rmin = 70;
+  const gapMinimum = 15; // Minimum de réduction entre phases (mètres) pour que ce soit visible
+
+  // Base sur le temps : 1 phase tous les 5-6 minutes, min 3, max 8
+  const timeBasedCount = Math.min(Math.max(3, Math.floor(timeLimitMinutes / 5)), 8);
+
+  // Base sur le rayon : s'assurer que chaque réduction est significative
+  const radiusBasedCount = Math.floor((R0 - Rmin) / gapMinimum);
+
+  // Prendre le minimum des deux pour éviter trop de phases avec petits gaps
+  return Math.min(timeBasedCount, radiusBasedCount);
+}
+
+function calculateFinalWaitRatio(timeLimitMinutes) {
+  // Pour les parties courtes, réserver plus de temps pour la phase d'attente finale
+  // Minimum 1 minute d'attente, maximum 5% du temps total
+  const minWaitMinutes = 1;
+  const maxRatio = 0.05; // 5%
+
+  // Si la partie est très courte, réserver une plus grande proportion
+  if (timeLimitMinutes <= 10) {
+    // Pour 10 min ou moins, réserver au moins 1 minute (10% ou plus)
+    return Math.max(minWaitMinutes / timeLimitMinutes, maxRatio);
+  } else if (timeLimitMinutes <= 15) {
+    // Pour 10-15 min, réserver environ 8-10%
+    return Math.max(minWaitMinutes / timeLimitMinutes, 0.08);
+  } else {
+    // Pour les parties longues, garder 5%
+    return maxRatio;
+  }
+}
 
 const defaultSettings = () => {
   const settings = {
@@ -116,11 +149,17 @@ function getShrinkState(room) {
   }
 
   const scale = Number(room.powerZoneScale || 1);
+
+  // Ne pas afficher de nextZone pour la dernière phase (phase d'attente pure)
+  const isLastPhase = phaseIdx === totalPhases - 1;
+  const isPureWaitPhase = currentPhaseInfo.shrinkRatio === 0.0;
+  const showNextZone = !(isLastPhase && isPureWaitPhase);
+
   return {
     currentRadius: currentRadius * scale,
     currentCenter,
-    nextRadius: currentPhaseInfo.endZone.radius * scale,
-    nextCenter: currentPhaseInfo.endZone.center,
+    nextRadius: showNextZone ? currentPhaseInfo.endZone.radius * scale : null,
+    nextCenter: showNextZone ? currentPhaseInfo.endZone.center : null,
     phaseEndsAt: room.huntStartedAt + currentPhaseInfo.endTime,
     shrinkStartsAt: room.huntStartedAt + shrinkStartTime,
     phaseState:
@@ -782,6 +821,14 @@ function buildGameSummary(room) {
     }),
     colors: { ...(room.playerColors || {}) },
     partyChat: [...(room.partyChat || [])].slice(-200),
+    shrinkPhasesList: room.shrinkPhasesList
+      ? room.shrinkPhasesList.map((ph) => ({
+          ...ph,
+          startZone: ph.startZone ? { ...ph.startZone, center: { ...ph.startZone.center } } : null,
+          endZone: ph.endZone ? { ...ph.endZone, center: { ...ph.endZone.center } } : null,
+        }))
+      : null,
+    balises: [...(room.balises || [])],
     analytics,
   };
 }
@@ -945,6 +992,8 @@ export function createRoomsStore({
       invisFrozenLng: null,
       movementLockedUntil: null,
       outOfBoundsOverrideUntil: null,
+      outOfBoundsSince: null,
+      lastCoinsLostAtBounds: 0,
       powerCooldowns: {},
     };
     const settings = defaultSettings();
@@ -1063,6 +1112,8 @@ export function createRoomsStore({
       invisFrozenLng: null,
       movementLockedUntil: null,
       outOfBoundsOverrideUntil: null,
+      outOfBoundsSince: null,
+      lastCoinsLostAtBounds: 0,
       powerCooldowns: {},
     };
     room.players.set(socketId, player);
@@ -1251,8 +1302,13 @@ export function createRoomsStore({
     if (room.settings.shrinkZoneEnabled) {
       const timeLimitMs = Math.max(1, Number(room.settings.timeLimitMinutes) || 30) * 60 * 1000;
       const R0 = Number(room.settings.globalRadiusM) || 500;
-      const Rmin = 50; // hardcode 50m minimum
-      const phaseCount = 6; // Hardcode exactly 6 phases to ensure a good distribution
+      const Rmin = 70;
+      const phaseCount = calculateAdaptivePhaseCount(room.settings.timeLimitMinutes || 30, R0);
+
+      // Réserver un pourcentage adaptatif du temps total pour la phase d'attente finale à 70m
+      const finalWaitRatio = calculateFinalWaitRatio(room.settings.timeLimitMinutes || 30);
+      const shrinkTimeMs = timeLimitMs * (1 - finalWaitRatio); // Le reste pour le rétrécissement
+      const finalWaitTimeMs = timeLimitMs * finalWaitRatio; // Pourcentage adaptatif pour l'attente finale
       
       let currentCenter = { ...room.gameCenter };
       const zones = [];
@@ -1266,11 +1322,11 @@ export function createRoomsStore({
 
         let waitRatio, shrinkRatio;
         if (isLast) {
-          waitRatio = 1.0;
-          shrinkRatio = 0.0;
+          waitRatio = 0.5;  // Attendre 50% du temps
+          shrinkRatio = 0.5; // Rétrécir pendant 50% du temps
         } else if (isSecondLast) {
           waitRatio = 0.8;
-          shrinkRatio = 0.2; 
+          shrinkRatio = 0.2;
         } else if (isFirst) {
           waitRatio = 0.7;
           shrinkRatio = 0.3;
@@ -1311,8 +1367,8 @@ export function createRoomsStore({
       
       for (let i = 0; i < phaseCount; i++) {
         const p = phaseWeights[i];
-        const durationMs = timeLimitMs * (p.weight / totalWeight);
-        
+        const durationMs = shrinkTimeMs * (p.weight / totalWeight);
+
         const startMs = timeAccum;
         timeAccum += durationMs;
         const endMs = timeAccum;
@@ -1326,6 +1382,19 @@ export function createRoomsStore({
           endZone: zones[i+1]
         });
       }
+
+      // Ajouter une phase d'attente pure à 70m après la dernière phase
+      const finalStartMs = timeAccum;
+      const finalEndMs = timeAccum + finalWaitTimeMs;
+      phasesList.push({
+        startTime: finalStartMs,
+        endTime: finalEndMs,
+        waitRatio: 1.0,  // Attente pure
+        shrinkRatio: 0.0, // Pas de rétrécissement
+        startZone: zones[phaseCount], // Zone de 70m
+        endZone: zones[phaseCount]    // Même zone (pas de changement)
+      });
+
       room.shrinkPhasesList = phasesList;
     } else {
       room.shrinkPhasesList = null;
@@ -1452,12 +1521,39 @@ export function createRoomsStore({
     if (p.outOfBoundsOverrideUntil != null && Date.now() < p.outOfBoundsOverrideUntil) {
       isNowOutOfBounds = false;
     }
-    
+
     if (!wasOutOfBounds && isNowOutOfBounds) {
       p.justWentOutOfBounds = true;
+      p.outOfBoundsSince = Date.now(); // Track when player went out of bounds
     }
     if (wasOutOfBounds && !isNowOutOfBounds) {
       p.justReenteredZone = true;
+      p.outOfBoundsSince = null; // Reset when player reenters
+    }
+
+    // Progressive coin loss when out of bounds
+    if (isNowOutOfBounds && p.outOfBoundsSince != null) {
+      const timeOutOfBoundsMs = Date.now() - p.outOfBoundsSince;
+      const timeOutOfBoundsSec = timeOutOfBoundsMs / 1000;
+
+      // Lose 1 coin every 10 seconds out of bounds (max 1 coin per second to avoid too much loss)
+      const coinsToLose = Math.floor(timeOutOfBoundsSec / 10);
+      const lastCoinsLost = p.lastCoinsLostAtBounds || 0;
+
+      if (coinsToLose > lastCoinsLost && (p.coins || 0) > 0) {
+        const coinsLost = Math.min(coinsToLose - lastCoinsLost, p.coins || 0);
+        if (coinsLost > 0) {
+          p.coins = Math.max(0, (p.coins || 0) - coinsLost);
+          p.lastCoinsLostAtBounds = coinsToLose;
+          p.justLostCoins = true; // Flag to trigger client update
+          pushTimeline(room, {
+            type: "coins_lost_out_of_bounds",
+            sessionId: p.sessionId,
+            nickname: p.nickname,
+            coinsLost: coinsLost,
+          });
+        }
+      }
     }
   }
 
@@ -2006,17 +2102,19 @@ export function createRoomsStore({
 
     const shrink = getShrinkState(room);
     const R0now = Number(shrink.currentRadius) || Number(room.settings.globalRadiusM) || 500;
-    const Rmin = 50;
+    const Rmin = 70;
+
+    // Réserver un pourcentage adaptatif du temps restant pour la phase d'attente finale à 70m
+    const remainingMinutes = remainingMs / (60 * 1000);
+    const finalWaitRatio = calculateFinalWaitRatio(remainingMinutes);
+    const shrinkRemainingMs = remainingMs * (1 - finalWaitRatio); // Le reste pour le rétrécissement
+    const finalWaitRemainingMs = remainingMs * finalWaitRatio; // Pourcentage adaptatif pour l'attente finale
 
     const past = Array.isArray(room.shrinkPhasesList)
       ? room.shrinkPhasesList.filter((ph) => (room.huntStartedAt + ph.endTime) <= now)
       : [];
 
-    let count;
-    if (remainingMs < 4 * 60 * 1000) count = 2;
-    else if (remainingMs < 8 * 60 * 1000) count = 3;
-    else if (remainingMs < 14 * 60 * 1000) count = 4;
-    else count = 5;
+    const count = calculateAdaptivePhaseCount(remainingMs / (60 * 1000), R0now);
 
     let currentCenter = shrink.currentCenter || room.gameCenter;
     const zones = [];
@@ -2040,7 +2138,7 @@ export function createRoomsStore({
       const isLast = i === count - 1;
       const isSecondLast = i === count - 2;
       let waitRatio, shrinkRatio;
-      if (isLast) { waitRatio = 1.0; shrinkRatio = 0.0; }
+      if (isLast) { waitRatio = 0.5; shrinkRatio = 0.5; }
       else if (isSecondLast) { waitRatio = 0.8; shrinkRatio = 0.2; }
       else if (isFirst) { waitRatio = 0.6; shrinkRatio = 0.4; }
       else { waitRatio = 0.4; shrinkRatio = 0.6; }
@@ -2055,7 +2153,7 @@ export function createRoomsStore({
     let t = elapsed;
     for (let i = 0; i < count; i++) {
       const p = weights[i];
-      const dur = remainingMs * (p.w / totalW);
+      const dur = shrinkRemainingMs * (p.w / totalW);
       const startTime = t;
       const endTime = t + dur;
       phases.push({
@@ -2068,6 +2166,18 @@ export function createRoomsStore({
       });
       t = endTime;
     }
+
+    // Ajouter une phase d'attente pure à 70m après la dernière phase
+    const finalStartMs = t;
+    const finalEndMs = t + finalWaitRemainingMs;
+    phases.push({
+      startTime: finalStartMs,
+      endTime: finalEndMs,
+      waitRatio: 1.0,  // Attente pure
+      shrinkRatio: 0.0, // Pas de rétrécissement
+      startZone: zones[count], // Zone de 70m
+      endZone: zones[count]    // Même zone (pas de changement)
+    });
 
     room.shrinkPhasesList = past.concat(phases);
   }

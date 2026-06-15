@@ -440,6 +440,18 @@ io.on("connection", (socket) => {
           nickname: player.nickname
         });
       }
+      if (player.justLostCoins) {
+        player.justLostCoins = false;
+        const timeline = room.timeline || [];
+        const lastTimelineEntry = timeline[timeline.length - 1];
+        if (lastTimelineEntry && lastTimelineEntry.type === "coins_lost_out_of_bounds" && lastTimelineEntry.sessionId === player.sessionId) {
+          io.to(room.code).emit("coins_lost", {
+            sessionId: player.sessionId,
+            nickname: player.nickname,
+            coinsLost: lastTimelineEntry.coinsLost
+          });
+        }
+      }
       store.appendLocationSample(room, player);
       store.broadcastPlayingState(io, room);
     }
