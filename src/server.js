@@ -353,6 +353,28 @@ io.on("connection", (socket) => {
     cb?.({ ok: true });
   });
 
+  /** Player marks that they have seen their role */
+  socket.on("player_saw_role", (_data, cb) => {
+    const code = store.socketToRoom.get(socket.id);
+    if (!code) {
+      cb?.({ ok: false, error: "Not in a room" });
+      return;
+    }
+    const room = store.getRoomByCode(code);
+    if (!room || room.phase !== "role_reveal") {
+      cb?.({ ok: false, error: "Invalid phase" });
+      return;
+    }
+    const player = room.players.get(socket.id);
+    if (!player) {
+      cb?.({ ok: false, error: "Player not found" });
+      return;
+    }
+    player.hasSeenRole = true;
+    io.to(room.code).emit("roles_reveal", store.buildRolesRevealPayload(room));
+    cb?.({ ok: true });
+  });
+
   socket.on("refresh_state", () => {
     const code = store.socketToRoom.get(socket.id);
     if (!code) return;

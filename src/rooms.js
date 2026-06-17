@@ -36,6 +36,20 @@ function randomCode(len = 5) {
   return s;
 }
 
+function recordCoinTransaction(player, amount, source, reason) {
+  if (!player.coinHistory) player.coinHistory = [];
+  player.coinHistory.push({
+    timestamp: Date.now(),
+    amount,
+    source,
+    reason
+  });
+  // Keep only last 100 transactions
+  if (player.coinHistory.length > 100) {
+    player.coinHistory = player.coinHistory.slice(-100);
+  }
+}
+
 function calculateAdaptivePhaseCount(timeLimitMinutes, globalRadiusM) {
   const R0 = globalRadiusM || 500;
   const Rmin = 70;
@@ -549,6 +563,7 @@ function updateBalises(room, io) {
       if (balise.captureProgress >= captureTime) {
         balise.capturedBy = currentPlayerInside.sessionId;
         currentPlayerInside.coins = (currentPlayerInside.coins || 0) + 10;
+        recordCoinTransaction(currentPlayerInside, 10, "balise", "Capture de balise");
         pushTimeline(room, {
           type: "balise_captured",
           baliseId: balise.id,
@@ -730,6 +745,7 @@ function computePlayerAnalytics(room, timeline) {
       spectator: Boolean(player.spectator),
       captured: Boolean(player.captured),
       coins: player.coins || 0,
+      coinHistory: player.coinHistory || [],
       catTimeMs: catTime,
       timeAsPlayerMs:
         gameDurationMs != null ? Math.max(0, gameDurationMs - catTime) : null,
@@ -809,6 +825,7 @@ function buildGameSummary(room) {
         spectator: Boolean(p.spectator),
         captured: Boolean(p.captured),
         coins: p.coins || 0,
+        coinHistory: p.coinHistory || [],
         totalCatTimeMs:
           playerAnalytics.catTimeMs != null
             ? playerAnalytics.catTimeMs
@@ -986,6 +1003,7 @@ export function createRoomsStore({
       jamAnchorLat: null,
       jamAnchorLng: null,
       coins: 0,
+      coinHistory: [],
       invisUntil: null,
       invisSince: null,
       invisFrozenLat: null,
@@ -1106,6 +1124,7 @@ export function createRoomsStore({
       jamAnchorLat: null,
       jamAnchorLng: null,
       coins: 0,
+      coinHistory: [],
       invisUntil: null,
       invisSince: null,
       invisFrozenLat: null,
@@ -1479,6 +1498,7 @@ export function createRoomsStore({
         nickname: p.nickname,
         role: p.role,
         originalRole: p.originalRole,
+        hasSeenRole: p.hasSeenRole || false,
       })),
       hostSessionId: room.players.get(room.hostId)?.sessionId ?? null,
       partyChat: [...(room.partyChat || [])].slice(-80),
@@ -1546,6 +1566,7 @@ export function createRoomsStore({
           p.coins = Math.max(0, (p.coins || 0) - coinsLost);
           p.lastCoinsLostAtBounds = coinsToLose;
           p.justLostCoins = true; // Flag to trigger client update
+          recordCoinTransaction(p, -coinsLost, "out_of_bounds", "Perte hors zone");
           pushTimeline(room, {
             type: "coins_lost_out_of_bounds",
             sessionId: p.sessionId,
@@ -1686,6 +1707,7 @@ export function createRoomsStore({
         captured: viewer.captured,
         spectator: viewer.spectator,
         coins: viewer.coins || 0,
+        coinHistory: viewer.coinHistory || [],
         catTimeMs: (viewer.catTimeMs || 0) + (viewer.role === "cat" && viewer.catSince ? Date.now() - viewer.catSince : 0),
         outOfBounds: viewer.lat != null && viewer.lng != null ? !isInsideGameZone(viewer.lat, viewer.lng, room) : false,
         immobilizedUntil: viewer.movementLockedUntil || null,
@@ -1922,6 +1944,10 @@ export function createRoomsStore({
     const preyCoins = prey.coins || 0;
     prey.coins = 0;
     cat.coins = (cat.coins || 0) + preyCoins;
+    if (preyCoins > 0) {
+      recordCoinTransaction(prey, -preyCoins, "capture", `Capture par ${cat.nickname}`);
+      recordCoinTransaction(cat, preyCoins, "capture", `Capture de ${prey.nickname}`);
+    }
     
     const mode = room.settings.gameMode || "tag_swap";
     if (mode === "tag_swap") {
@@ -2395,9 +2421,10 @@ export function createRoomsStore({
     const kind = String(body?.kind || "").toLowerCase();
     const now = Date.now();
 
-    const ensureCoins = (p, cost) => {
+    const ensureCoins = (p, cost, powerName = "power") => {
       if ((p.coins || 0) < cost) return false;
       p.coins = (p.coins || 0) - cost;
+      recordCoinTransaction(p, -cost, "power", `Pouvoir: ${powerName}`);
       return true;
     };
     const findBySessionId = (sid) => {
@@ -2442,7 +2469,7 @@ export function createRoomsStore({
       }
 
       const cost = Number(room.powerCosts?.balise_leurre || 60);
-      if (!ensureCoins(actor, cost)) return { error: "Pas assez de pièces." };
+      if (!ensureCoins(actor, cost, "balise_leurre")) return { error: "Pas assez de pièces." };
 
       room.nextBaliseOverride = {
         lat,
@@ -2485,7 +2512,7 @@ export function createRoomsStore({
       const cost = Math.max(1, Math.ceil(rawCost));
 
       if (onCooldown(actor, "noise")) return { error: "Bruit en recharge." };
-      if (!ensureCoins(actor, cost)) return { error: "Pas assez de pièces." };
+      if (!ensureCoins(actor, cost, "noise")) return { error: "Pas assez de pièces." };
 
       for (const t of targets) {
         const sock = io.sockets.sockets.get(t.socketId);
@@ -2726,6 +2753,7 @@ export function createRoomsStore({
     const d = Math.floor(Number(delta || 0));
     if (!Number.isFinite(d)) return { error: "Delta invalide." };
     target.coins = Math.max(0, (target.coins || 0) + d);
+    recordCoinTransaction(target, d, "admin", `Ajustement admin: ${d > 0 ? '+' : ''}${d}`);
     pushTimeline(room, { type: "admin_adjust_coins", bySessionId: room.players.get(room.hostId)?.sessionId, targetSessionId, delta: d });
     broadcastPlayingState(io, room);
     return { ok: true, coins: target.coins };
