@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
+import { saveGameSummary } from "./supabase.js";
 import {
   haversineMeters,
   randomOffsetPoint,
@@ -1462,6 +1463,27 @@ export function createRoomsStore({
       message: msg,
     });
     const summary = buildGameSummary(room);
+    
+    // Save to Supabase
+    saveGameSummary({
+      code: summary.code,
+      huntStartedAt: summary.huntStartedAt,
+      endedAt: summary.endedAt,
+      durationMs: summary.endedAt && summary.huntStartedAt ? summary.endedAt - summary.huntStartedAt : null,
+      gameCenter: summary.gameCenter,
+      globalRadiusM: summary.globalRadiusM,
+      jamRadiusM: summary.jamRadiusM,
+      settingsSnapshot: summary.settingsSnapshot,
+      players: summary.players,
+      colors: summary.colors,
+      partyChat: summary.partyChat,
+      shrinkPhasesList: summary.shrinkPhasesList,
+      balises: summary.balises,
+      analytics: summary.analytics,
+    }).catch((err) => {
+      console.error('Failed to save game summary to Supabase:', err);
+    });
+    
     io.to(room.code).emit("game_finished", summary);
   }
 
@@ -2778,8 +2800,13 @@ export function createRoomsStore({
 
     // If still in lobby, remove player entirely
     if (room.phase === "lobby") {
+      // If host leaves during lobby, nuke the entire room to prevent game from starting
+      if (room.hostId === socketId) {
+        nukeRoom(io, room, "host_left");
+        return { ok: true };
+      }
       room.players.delete(socketId);
-      // If host left, assign new host
+      // If host left (shouldn't reach here due to above check), assign new host
       if (room.hostId === socketId && room.players.size > 0) {
         room.hostId = room.players.keys().next().value;
       }
