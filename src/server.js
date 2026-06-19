@@ -436,14 +436,20 @@ io.on("connection", (socket) => {
   });
 
   socket.on("position", ({ lat, lng }) => {
+    console.log('[Server] Position received from socket:', socket.id, { lat, lng });
     const ctx = store.setPosition(socket.id, lat, lng);
-    if (!ctx) return;
+    if (!ctx) {
+      console.log('[Server] setPosition returned null');
+      return;
+    }
     const { room, player } = ctx;
+    console.log('[Server] Position set for player:', player.sessionId, 'phase:', room.phase);
     if (room.phase === "lobby") {
       io.to(room.code).emit("lobby_update", store.buildLobbyPayload(room, io));
       return;
     }
     if (room.phase === "role_reveal") {
+      console.log('[Server] Broadcasting roles_reveal with updated positions');
       io.to(room.code).emit("roles_reveal", store.buildRolesRevealPayload(room));
       return;
     }

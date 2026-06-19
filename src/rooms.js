@@ -1044,6 +1044,7 @@ export function createRoomsStore({
         freeze_cats_multi: 80,
         freeze_cats_all: 140,
         balise_leurre: 60,
+        fake_position: 60,
       },
       powerUses: {}, // { [sessionId]: { [powerKey]: count } }
       powerMaxUses: {
@@ -1521,6 +1522,8 @@ export function createRoomsStore({
         role: p.role,
         originalRole: p.originalRole,
         hasSeenRole: p.hasSeenRole || false,
+        lat: p.lat,
+        lng: p.lng,
       })),
       hostSessionId: room.players.get(room.hostId)?.sessionId ?? null,
       partyChat: [...(room.partyChat || [])].slice(-80),
@@ -1737,6 +1740,7 @@ export function createRoomsStore({
         invisSince: viewer.invisSince || null,
         outOfBoundsOverrideUntil: viewer.outOfBoundsOverrideUntil || null,
         powerCooldowns: viewer.powerCooldowns || {},
+        fakePosition: viewer.fakePosition || null,
       },
       myJamCircle: null,
       allies: [],
@@ -1772,18 +1776,23 @@ export function createRoomsStore({
 
     const now = Date.now();
     for (const p of others) {
+      // Check if this player has an active fake position
+      const hasFakePosition = p.fakePosition && now < p.fakePosition.until;
+      const displayLat = hasFakePosition ? p.fakePosition.lat : p.lat;
+      const displayLng = hasFakePosition ? p.fakePosition.lng : p.lng;
+
       if (p.spectator || p.captured) {
         payload.spectators.push({
           sessionId: p.sessionId,
           nickname: p.nickname,
-          lat: p.lat,
-          lng: p.lng,
+          lat: displayLat,
+          lng: displayLng,
         });
         continue;
       }
 
       if (viewer.spectator || viewer.captured) {
-        if (p.lat == null || p.lng == null) continue;
+        if (displayLat == null || displayLng == null) continue;
         const invisActive = p.invisUntil != null && now < p.invisUntil;
         // En mode ghost, on ne montre plus la position sur la carte
         if (invisActive) continue;
@@ -1791,10 +1800,10 @@ export function createRoomsStore({
           sessionId: p.sessionId,
           nickname: p.nickname,
           role: p.role,
-          lat: p.lat,
-          lng: p.lng,
+          lat: displayLat,
+          lng: displayLng,
           disconnected: isDisconnectedGhost(p, io),
-          outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
+          outOfBounds: !isInsideGameZone(displayLat, displayLng, room),
           invisible: false,
         });
         continue;
@@ -1802,42 +1811,44 @@ export function createRoomsStore({
 
       if (viewer.role === "cat") {
         if (p.role === "cat") {
-          if (p.lat == null || p.lng == null) continue;
+          if (displayLat == null || displayLng == null) continue;
           const invisActive = p.invisUntil != null && now < p.invisUntil;
           if (invisActive) continue;
           payload.catsExact.push({
             sessionId: p.sessionId,
             nickname: p.nickname,
-            lat: p.lat,
-            lng: p.lng,
+            lat: displayLat,
+            lng: displayLng,
             disconnected: isDisconnectedGhost(p, io),
-            outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
+            outOfBounds: !isInsideGameZone(displayLat, displayLng, room),
           });
         } else if (p.role === "player") {
-          if (p.lat == null || p.lng == null) continue;
+          if (displayLat == null || displayLng == null) continue;
           const disc = isDisconnectedGhost(p, io);
           const invisActive = p.invisUntil != null && now < p.invisUntil;
           if (invisActive) {
             // Invisible prey fully hidden from cats
             continue;
           } else {
-            const inside = isInsideGameZone(p.lat, p.lng, room);
+            const inside = isInsideGameZone(displayLat, displayLng, room);
             if (!inside) {
               payload.preyForCat.push({
                 sessionId: p.sessionId,
                 nickname: p.nickname,
                 kind: "exact",
-                lat: p.lat,
-                lng: p.lng,
+                lat: displayLat,
+                lng: displayLng,
                 disconnected: disc,
                 outOfBounds: true,
               });
-            } else if (p.jamCircleCenter) {
+            } else if (p.jamCircleCenter || hasFakePosition) {
+              // Si le joueur a une fausse position, utiliser le centre du cercle de brouillage de la fausse position
+              const jamCenter = hasFakePosition ? (p.fakePosition.jamCircleCenter || { lat: p.fakePosition.lat, lng: p.fakePosition.lng }) : p.jamCircleCenter;
               payload.preyForCat.push({
                 sessionId: p.sessionId,
                 nickname: p.nickname,
                 kind: "circle",
-                center: p.jamCircleCenter,
+                center: jamCenter,
                 radiusM: jamRadiusM,
                 disconnected: disc,
               });
@@ -1846,19 +1857,32 @@ export function createRoomsStore({
         }
       } else if (viewer.role === "player") {
         if (p.role === "player") {
-          if (p.lat == null || p.lng == null) continue;
+          if (displayLat == null || displayLng == null) continue;
           const invisActive = p.invisUntil != null && now < p.invisUntil;
           if (invisActive) continue;
-          payload.allies.push({
+          
+          // Si le joueur a une fausse position, envoyer aussi le cercle de brouillage autour de la fausse position
+          const allyData = {
             sessionId: p.sessionId,
             nickname: p.nickname,
-            lat: p.lat,
-            lng: p.lng,
+            lat: displayLat,
+            lng: displayLng,
             disconnected: isDisconnectedGhost(p, io),
             invisible: false,
-          });
+          };
+          
+          if (hasFakePosition) {
+            // Utiliser le centre du cercle de brouillage de la fausse position
+            allyData.jamCircleCenter = p.fakePosition.jamCircleCenter || { lat: p.fakePosition.lat, lng: p.fakePosition.lng };
+            allyData.jamCircleRadiusM = jamRadiusM;
+          } else if (p.jamCircleCenter) {
+            allyData.jamCircleCenter = p.jamCircleCenter;
+            allyData.jamCircleRadiusM = jamRadiusM;
+          }
+          
+          payload.allies.push(allyData);
         } else if (p.role === "cat") {
-          if (p.lat == null || p.lng == null) continue;
+          if (displayLat == null || displayLng == null) continue;
           const invisActive = p.invisUntil != null && now < p.invisUntil;
           if (invisActive) {
             // On ne montre pas non plus les chats en ghost
@@ -1867,10 +1891,10 @@ export function createRoomsStore({
           payload.catsExact.push({
             sessionId: p.sessionId,
             nickname: p.nickname,
-            lat: p.lat,
-            lng: p.lng,
+            lat: displayLat,
+            lng: displayLng,
             disconnected: isDisconnectedGhost(p, io),
-            outOfBounds: !isInsideGameZone(p.lat, p.lng, room),
+            outOfBounds: !isInsideGameZone(displayLat, displayLng, room),
             invisible: false,
           });
         }
@@ -1924,6 +1948,86 @@ export function createRoomsStore({
     if (!rooms.get(room.code)) return;
     syncJamCircles(room);
     updateBalises(room, io);
+
+    // Update fake positions with random credible movements
+    const now = Date.now();
+    for (const player of room.players.values()) {
+      if (player.fakePosition && player.fakePosition.until > now) {
+        // Update fake position every 2-3 seconds with more realistic movements
+        if (!player.fakePosition.lastUpdate || now - player.fakePosition.lastUpdate > 2000 + Math.random() * 1000) {
+          // Initialize movement direction if not set
+          if (!player.fakePosition.movementDirection) {
+            const angle = Math.random() * Math.PI * 2;
+            // Speed varies: walk (~5km/h = ~1.4m/s) to run (~15km/h = ~4.2m/s)
+            // With 2-3s update: ~3-12m per update
+            const speed = 0.00005 + Math.random() * 0.0001; // ~5-12m per update
+            player.fakePosition.movementDirection = {
+              lat: Math.sin(angle) * speed,
+              lng: Math.cos(angle) * speed,
+              speed: speed
+            };
+          }
+
+          // Occasionally change direction slightly for more natural movement
+          if (Math.random() < 0.25) {
+            const angleChange = (Math.random() - 0.5) * 0.3; // Smaller angle change
+            const currentAngle = Math.atan2(
+              player.fakePosition.movementDirection.lat,
+              player.fakePosition.movementDirection.lng
+            );
+            const newAngle = currentAngle + angleChange;
+            // Vary speed occasionally (walk vs run)
+            const speed = player.fakePosition.movementDirection.speed * (0.7 + Math.random() * 0.6);
+            player.fakePosition.movementDirection = {
+              lat: Math.sin(newAngle) * speed,
+              lng: Math.cos(newAngle) * speed,
+              speed: speed
+            };
+          }
+
+          // Apply movement with some randomness
+          const randomFactor = 0.7 + Math.random() * 0.3; // 0.7 to 1.0
+          const newLat = player.fakePosition.lat + player.fakePosition.movementDirection.lat * randomFactor;
+          const newLng = player.fakePosition.lng + player.fakePosition.movementDirection.lng * randomFactor;
+
+          // Ensure the new position is still in the game zone
+          if (isInsideGameZone(newLat, newLng, room)) {
+            player.fakePosition.lat = newLat;
+            player.fakePosition.lng = newLng;
+            player.fakePosition.lastUpdate = now;
+          } else {
+            // Reverse direction if hitting boundary
+            player.fakePosition.movementDirection.lat *= -1;
+            player.fakePosition.movementDirection.lng *= -1;
+          }
+
+          // Update jam circle only if fake position is far from current jam circle center
+          // This simulates real behavior: jam circle follows player position
+          if (player.fakePosition.jamCircleCenter) {
+            const jamRadiusM = room.settings.jamRadiusM || 80;
+            // Convert radius to degrees (approximate)
+            const radiusInDegrees = jamRadiusM / 111000; // ~1 degree = 111km
+            const distanceFromJamCenter = Math.sqrt(
+              Math.pow(player.fakePosition.lat - player.fakePosition.jamCircleCenter.lat, 2) +
+              Math.pow(player.fakePosition.lng - player.fakePosition.jamCircleCenter.lng, 2)
+            );
+
+            // Only update jam circle if fake position is more than 60% of radius away
+            if (distanceFromJamCenter > radiusInDegrees * 0.6) {
+              // Move jam circle center towards fake position
+              const moveFactor = 0.3; // Move 30% towards fake position
+              player.fakePosition.jamCircleCenter.lat += (player.fakePosition.lat - player.fakePosition.jamCircleCenter.lat) * moveFactor;
+              player.fakePosition.jamCircleCenter.lng += (player.fakePosition.lng - player.fakePosition.jamCircleCenter.lng) * moveFactor;
+              player.fakePosition.jamCircleLastUpdate = now;
+            }
+          }
+        }
+      } else if (player.fakePosition && player.fakePosition.until <= now) {
+        // Remove expired fake position
+        player.fakePosition = null;
+      }
+    }
+
     for (const socketId of room.players.keys()) {
       const sock = io.sockets.sockets.get(socketId);
       if (!sock) continue;
@@ -2732,6 +2836,52 @@ export function createRoomsStore({
       return { ok: true };
     }
 
+    if (kind === "fake_position") {
+      // Pouvoir de leurre de position : affiche une fausse position aux autres joueurs
+      if (actor.role !== "player") return { error: "Réservé aux joueurs." };
+      if (onCooldown(actor, "fake_position")) return { error: "Leurre en recharge." };
+
+      const durationSec = Math.max(30, Math.min(300, Number(body?.durationSec) || 60));
+      const cost = Number(room.powerCosts?.fake_position || 60);
+
+      if (!ensureCoins(actor, cost, "fake_position")) return { error: "Pas assez de pièces." };
+
+      // La fausse position commence à la position réelle du joueur
+      // Elle bougera ensuite de manière aléatoire mais crédible
+      const fakeLat = actor.lat;
+      const fakeLng = actor.lng;
+
+      actor.fakePosition = {
+        lat: fakeLat,
+        lng: fakeLng,
+        realLat: actor.lat,
+        realLng: actor.lng,
+        until: now + durationSec * 1000,
+        bySessionId: actor.sessionId,
+        lastUpdate: now,
+        // Le cercle de brouillage de la fausse position commence à la vraie position
+        jamCircleCenter: { lat: actor.lat, lng: actor.lng },
+        jamCircleLastUpdate: now,
+      };
+
+      pushTimeline(room, { type: "power_fake_position", bySessionId: actor.sessionId, durationSec });
+      setCooldown(actor, "fake_position", 180);
+      broadcastPlayingState(io, room);
+      return { ok: true };
+    }
+
+    if (kind === "fake_position_cancel") {
+      // Annuler le leurre de position et revenir à la vraie position
+      if (!actor.fakePosition || now >= actor.fakePosition.until) {
+        return { error: "Pas de leurre actif." };
+      }
+      
+      actor.fakePosition = null;
+      pushTimeline(room, { type: "power_fake_position_end", bySessionId: actor.sessionId });
+      broadcastPlayingState(io, room);
+      return { ok: true };
+    }
+
     return { error: "Pouvoir inconnu." };
   }
 
@@ -2752,6 +2902,7 @@ export function createRoomsStore({
       "freeze_cats_single",
       "freeze_cats_multi",
       "freeze_cats_all",
+      "fake_position",
     ];
     for (const k of valid) {
       if (partialCosts && partialCosts[k] != null) {
@@ -2798,9 +2949,9 @@ export function createRoomsStore({
     }
     socketToRoom.delete(socketId);
 
-    // If still in lobby, remove player entirely
-    if (room.phase === "lobby") {
-      // If host leaves during lobby, nuke the entire room to prevent game from starting
+    // If still in lobby, role_reveal, or configuration phases, remove player entirely
+    if (room.phase === "lobby" || room.phase === "role_reveal") {
+      // If host leaves during lobby or role_reveal, nuke the entire room to prevent game from starting
       if (room.hostId === socketId) {
         nukeRoom(io, room, "host_left");
         return { ok: true };
