@@ -188,6 +188,78 @@ function getShrinkState(room) {
   };
 }
 
+/** Compute shrink state for an absolute timestamp (ms since epoch). */
+function getShrinkStateAtTimestamp(room, absT) {
+  if (!room || !room.shrinkPhasesList || !room.huntStartedAt) return getShrinkState(room);
+  const elapsed = absT - room.huntStartedAt;
+  const phases = room.shrinkPhasesList;
+  const totalPhases = phases.length;
+  if (elapsed <= 0) {
+    return {
+      currentRadius: phases[0].startZone.radius * (Number(room.powerZoneScale || 1)),
+      currentCenter: phases[0].startZone.center,
+      nextRadius: phases[0].endZone ? phases[0].endZone.radius * (Number(room.powerZoneScale || 1)) : null,
+      nextCenter: phases[0].endZone ? phases[0].endZone.center : null,
+      phaseEndsAt: room.huntStartedAt + phases[0].endTime,
+      shrinkStartsAt: room.huntStartedAt + (phases[0].startTime + (phases[0].endTime - phases[0].startTime) * phases[0].waitRatio),
+      phaseState: 'waiting',
+      currentPhase: 1,
+      totalPhases
+    };
+  }
+
+  let currentPhaseInfo = phases[totalPhases - 1];
+  let phaseIdx = totalPhases - 1;
+  for (let i = 0; i < totalPhases; i++) {
+    if (elapsed < phases[i].endTime) {
+      currentPhaseInfo = phases[i];
+      phaseIdx = i;
+      break;
+    }
+  }
+
+  const phaseDuration = currentPhaseInfo.endTime - currentPhaseInfo.startTime;
+  const shrinkStartTime = currentPhaseInfo.startTime + phaseDuration * currentPhaseInfo.waitRatio;
+  let currentRadius, currentCenter;
+  if (elapsed < shrinkStartTime) {
+    currentRadius = currentPhaseInfo.startZone.radius;
+    currentCenter = currentPhaseInfo.startZone.center;
+  } else if (elapsed < currentPhaseInfo.endTime) {
+    const progress = (elapsed - shrinkStartTime) / (phaseDuration * currentPhaseInfo.shrinkRatio);
+    currentRadius = currentPhaseInfo.startZone.radius + (currentPhaseInfo.endZone.radius - currentPhaseInfo.startZone.radius) * progress;
+    const latOffset = (currentPhaseInfo.endZone.center.lat - currentPhaseInfo.startZone.center.lat) * progress;
+    const lngOffset = (currentPhaseInfo.endZone.center.lng - currentPhaseInfo.startZone.center.lng) * progress;
+    currentCenter = {
+      lat: currentPhaseInfo.startZone.center.lat + latOffset,
+      lng: currentPhaseInfo.startZone.center.lng + lngOffset,
+    };
+  } else {
+    currentRadius = currentPhaseInfo.endZone.radius;
+    currentCenter = currentPhaseInfo.endZone.center;
+  }
+
+  const scale = Number(room.powerZoneScale || 1);
+  const isLastPhase = phaseIdx === totalPhases - 1;
+  const isPureWaitPhase = currentPhaseInfo.shrinkRatio === 0.0;
+  const showNextZone = !(isLastPhase && isPureWaitPhase);
+  return {
+    currentRadius: currentRadius * scale,
+    currentCenter,
+    nextRadius: showNextZone ? currentPhaseInfo.endZone.radius * scale : null,
+    nextCenter: showNextZone ? currentPhaseInfo.endZone.center : null,
+    phaseEndsAt: room.huntStartedAt + currentPhaseInfo.endTime,
+    shrinkStartsAt: room.huntStartedAt + shrinkStartTime,
+    phaseState:
+      elapsed < shrinkStartTime
+        ? "waiting"
+        : elapsed < currentPhaseInfo.endTime
+          ? "shrinking"
+          : "stopped",
+    currentPhase: phaseIdx + 1,
+    totalPhases,
+  };
+}
+
 function getEffectiveGlobalRadius(room) {
   const result = getShrinkState(room).currentRadius;
   return result;
@@ -449,9 +521,10 @@ function pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, bali
   );
 }
 
-async function spawnBalise(room) {
+async function spawnBalise(room, spawnAt = null) {
   if (!room.gameCenter) return;
-  const shrink = getShrinkState(room);
+  const t = Number.isFinite(spawnAt) ? spawnAt : Date.now();
+  const shrink = spawnAt ? getShrinkStateAtTimestamp(room, t) : getShrinkState(room);
   const effectiveCenter = shrink.currentCenter || room.gameCenter;
   const effectiveRadius = shrink.currentRadius || getEffectiveGlobalRadius(room);
   const radiusFactor = 0.04 + Math.random() * 0.04;
@@ -509,8 +582,8 @@ function updateBalises(room, io) {
   if (!room.lastBaliseSpawnAt || now - room.lastBaliseSpawnAt >= baliseSpawnInterval || room.balises.length === 0) {
     if (!room.baliseSpawnPending) {
       room.baliseSpawnPending = true;
-      room.lastBaliseSpawnAt = now;
-      spawnBalise(room)
+  room.lastBaliseSpawnAt = now;
+  spawnBalise(room, room.lastBaliseSpawnAt)
         .catch((e) => {
           console.warn("Erreur création balise:", e?.message || e);
         })
@@ -563,14 +636,29 @@ function updateBalises(room, io) {
       
       if (balise.captureProgress >= captureTime) {
         balise.capturedBy = currentPlayerInside.sessionId;
-        currentPlayerInside.coins = (currentPlayerInside.coins || 0) + 10;
-        recordCoinTransaction(currentPlayerInside, 10, "balise", "Capture de balise");
+        const award = 20; // Award 20 coins per user request
+        currentPlayerInside.coins = (currentPlayerInside.coins || 0) + award;
+        recordCoinTransaction(currentPlayerInside, award, "balise", "Capture de balise");
         pushTimeline(room, {
           type: "balise_captured",
           baliseId: balise.id,
           sessionId: currentPlayerInside.sessionId,
           nickname: currentPlayerInside.nickname,
+          awardedCoins: award,
         });
+        try {
+          // Notify clients immediately so UI can show coin feed / capture toast
+          if (io && room.code) {
+            io.to(room.code).emit("balise_captured", {
+              baliseId: balise.id,
+              sessionId: currentPlayerInside.sessionId,
+              nickname: currentPlayerInside.nickname,
+              awardedCoins: award,
+            });
+          }
+        } catch (e) {
+          console.warn('Failed to emit balise_captured socket event:', e?.message || e);
+        }
         toRemove.push(balise.id);
       }
     } else {
@@ -1741,6 +1829,7 @@ export function createRoomsStore({
         outOfBoundsOverrideUntil: viewer.outOfBoundsOverrideUntil || null,
         powerCooldowns: viewer.powerCooldowns || {},
         fakePosition: viewer.fakePosition || null,
+        noiseEffect: viewer.noiseEffect && (now - viewer.noiseEffect.startedAt) <= viewer.noiseEffect.durationSec * 1000 ? viewer.noiseEffect : null,
       },
       myJamCircle: null,
       allies: [],
@@ -2643,6 +2732,13 @@ export function createRoomsStore({
       for (const t of targets) {
         const sock = io.sockets.sockets.get(t.socketId);
         sock?.emit("play_noise", { durationSec, volume, by: actor.nickname });
+        // Store noise effect on player for persistence across page refreshes
+        t.noiseEffect = {
+          startedAt: now,
+          durationSec,
+          volume,
+          by: actor.nickname
+        };
       }
 
       pushTimeline(room, {
