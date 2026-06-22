@@ -1991,7 +1991,7 @@ export function createRoomsStore({
       adminPreyPreview: null,
       partyChat: [...(room.partyChat || [])].slice(-80),
       balises: room.balises || [],
-      nextBaliseAt: room.lastBaliseSpawnAt ? room.lastBaliseSpawnAt + 5 * 60 * 1000 : null,
+      nextBaliseAt: room.lastBaliseSpawnAt ? room.lastBaliseSpawnAt + 2 * 60 * 1000 : null,
       powerLimits: room.powerMaxUses || {},
       powerUses: room.powerUses?.[viewer.sessionId] || {},
     };
