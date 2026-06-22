@@ -96,12 +96,64 @@ function calculateFinalWaitRatio(timeLimitMinutes) {
   }
 }
 
+function calculateDynamicCatDelay(timeLimitMinutes, globalRadiusM, playerCount) {
+  // Base: 2-3% of game duration
+  const baseRatio = 0.025; // 2.5%
+  const delayMs = timeLimitMinutes * baseRatio * 60 * 1000;
+
+  // Adjust based on circle size: larger circle = more time to spread out
+  const R0 = globalRadiusM || 500;
+  const radiusFactor = Math.max(1, R0 / 500); // 1x for 500m, 2x for 1000m, etc.
+
+  // Adjust based on player count: more players = slightly more time
+  const playerFactor = Math.max(1, playerCount / 4); // 1x for 4 players, 1.5x for 6 players
+
+  // Calculate final delay
+  const adjustedDelayMs = delayMs * radiusFactor * playerFactor;
+
+  // Apply caps based on game length
+  const minDelayMs = 2 * 60 * 1000; // 2 minutes minimum
+  const maxRatio = 0.08; // 8% of game duration maximum
+  const maxDelayMs = timeLimitMinutes * maxRatio * 60 * 1000;
+
+  // For very short games, cap at a lower percentage
+  if (timeLimitMinutes <= 10) {
+    const shortGameMaxMs = timeLimitMinutes * 0.05 * 60 * 1000; // 5% max for short games
+    return Math.max(minDelayMs, Math.min(adjustedDelayMs, shortGameMaxMs));
+  }
+
+  // For very long games, cap at a reasonable absolute value
+  if (timeLimitMinutes >= 120) {
+    const longGameMaxMs = 8 * 60 * 1000; // 8 minutes max for very long games
+    return Math.max(minDelayMs, Math.min(adjustedDelayMs, longGameMaxMs));
+  }
+
+  return Math.max(minDelayMs, Math.min(adjustedDelayMs, maxDelayMs));
+}
+
+function calculateForcedWaitForNewCat(timeLimitMinutes, remainingTimeMs) {
+  // For 2-player games, when a player becomes a cat after capture,
+  // force a wait time to prevent immediate revenge hunting
+  // Base: 1 minute minimum
+  const minWaitMs = 1 * 60 * 1000; // 1 minute
+
+  // Dynamic based on remaining time, but with less representation than initial cat wait
+  // Use 1.5% of remaining time instead of 2.5%
+  const dynamicRatio = 0.015; // 1.5%
+  const dynamicWaitMs = remainingTimeMs * dynamicRatio;
+
+  // Cap at 3 minutes maximum to keep it reasonable
+  const maxWaitMs = 3 * 60 * 1000;
+
+  return Math.max(minWaitMs, Math.min(dynamicWaitMs, maxWaitMs));
+}
+
 const defaultSettings = () => {
   const settings = {
   globalRadiusM: 500,
   jamRadiusM: 80,
   catCount: 1,
-  catDelayMinutes: 5,
+  catDelayMinutes: 0, // 0 = use dynamic calculation
   /** Zone globale qui rétrécit avec le temps */
   shrinkZoneEnabled: false,
   /** Fin forcée après X minutes (désactivable) */
@@ -606,7 +658,7 @@ async function spawnBalise(room, spawnAt = null) {
     placementHint: position.source === "osm" ? "osm_pedestrian_way" : position.source || "fallback_random",
     osmWayId: position.osmWayId || null,
     createdAt: Date.now(),
-    // Remove expiration - balises should stay until captured or game ends
+    expiresAt: Date.now() + (2 * 60 * 1000), // 2 minutes
     capturedBy: null,
     captureProgress: 0,
     beingCapturedBy: null,
@@ -646,6 +698,12 @@ function updateBalises(room, io) {
   
   for (const balise of room.balises) {
     if (balise.capturedBy) {
+      toRemove.push(balise.id);
+      continue;
+    }
+
+    // Remove expired balises
+    if (balise.expiresAt && now >= balise.expiresAt) {
       toRemove.push(balise.id);
       continue;
     }
@@ -1662,9 +1720,16 @@ export function createRoomsStore({
       type: "hunt_started",
       message: "La chasse a commencé",
     });
-    const delayMs = Math.max(0, Number(room.settings.catDelayMinutes) || 0) * 60 * 1000;
+    // Calculate dynamic cat delay based on game duration, circle size, and player count
+    const timeLimitMinutes = Math.max(1, Number(room.settings.timeLimitMinutes) || 30);
+    const globalRadiusM = Number(room.settings.globalRadiusM) || 500;
+    const playerCount = list.filter((p) => !p.spectator).length;
+    const dynamicDelayMs = calculateDynamicCatDelay(timeLimitMinutes, globalRadiusM, playerCount);
+    // Allow manual override via catDelayMinutes setting if set
+    const manualDelayMs = Math.max(0, Number(room.settings.catDelayMinutes) || 0) * 60 * 1000;
+    const delayMs = manualDelayMs > 0 ? manualDelayMs : dynamicDelayMs;
     room.catMapUnlockAt = Date.now() + delayMs;
-    console.log(`Chasse démarrée (${room.code}) · carte chats vers ${new Date(room.catMapUnlockAt).toLocaleTimeString()}`);
+    console.log(`Chasse démarrée (${room.code}) · carte chats vers ${new Date(room.catMapUnlockAt).toLocaleTimeString()} (délai: ${Math.round(delayMs / 1000 / 60)}min)`);
     return { ok: true, room };
   }
 
@@ -2358,15 +2423,20 @@ export function createRoomsStore({
       prey.jamCircleCenter = null;
       prey.jamAnchorLat = null;
       prey.jamAnchorLng = null;
-      
-      // Appliquer les règles selon le nombre de joueurs
+
+      // For 2-player games, force a wait time for the new cat to prevent immediate revenge
       if (activePlayerCount === 2) {
-        // Délai d'attente de 1 minute pour 2 joueurs
-        prey.captureCooldownUntil = now + 60 * 1000; // 1 minute
-        prey.forcedWaitTimeMs = 60 * 1000; // Pour exclusion des stats
+        const timeLimitMinutes = Math.max(1, Number(room.settings.timeLimitMinutes) || 30);
+        const remainingTimeMs = room.settings.timeLimitEnabled && room.huntStartedAt
+          ? Math.max(0, (room.huntStartedAt + timeLimitMinutes * 60 * 1000) - now)
+          : timeLimitMinutes * 60 * 1000;
+        const forcedWaitMs = calculateForcedWaitForNewCat(timeLimitMinutes, remainingTimeMs);
+        prey.forcedWaitTimeMs = forcedWaitMs;
+        prey.captureCooldownUntil = now + forcedWaitMs;
+        console.log(`2-player game: New cat ${prey.nickname} will wait ${Math.round(forcedWaitMs / 1000)}s before hunting`);
         io.to(code).emit("capture_cooldown", {
           sessionId: prey.sessionId,
-          cooldownSeconds: 60,
+          cooldownSeconds: Math.round(forcedWaitMs / 1000),
           reason: "2_players_wait"
         });
       } else if (activePlayerCount === 3) {
