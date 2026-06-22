@@ -954,6 +954,7 @@ function computePlayerAnalytics(room, timeline) {
     .map((p) => ({
       sessionId: p.sessionId,
       catTimeMs: metrics[p.sessionId]?.catTimeMs || 0,
+      distanceMeters: metrics[p.sessionId]?.distanceMeters || 0,
     }))
     .sort((a, b) => a.catTimeMs - b.catTimeMs);
 
