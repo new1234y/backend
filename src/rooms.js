@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
-import { saveGameSummary } from "./supabase.js";
+import { saveGameSummary, saveGameMessage, saveTimelineEvent, saveSession, deleteSession, deleteActiveRoom, saveActivePower, removeActivePower, getActivePowers, cleanupExpiredPowers } from "./supabase.js";
 import {
   haversineMeters,
   randomOffsetPoint,
@@ -10,9 +10,20 @@ import {
 
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CAPTURE_DISTANCE_M = 15;
-const OVERPASS_URL = process.env.OVERPASS_URL || "https://overpass-api.de/api/interpreter";
+// Multiple Overpass API endpoints for fallback
+const OVERPASS_URLS = [
+  process.env.OVERPASS_URL || "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.openstreetmap.ru/api/interpreter"
+];
 const OSM_BALISE_CACHE_TTL_MS = 10 * 60 * 1000;
 const osmBaliseCache = new Map();
+
+function isValidCoordinates(lat, lng) {
+  return Number.isFinite(lat) && Number.isFinite(lng) && 
+         lat >= -90 && lat <= 90 && 
+         lng >= -180 && lng <= 180;
+}
 
 const COLOR_PALETTE = [
   "#3b82f6",
@@ -276,6 +287,14 @@ function isInsideGameZone(lat, lng, room) {
 function pushTimeline(room, evt) {
   if (!room.timelineEvents) room.timelineEvents = [];
   room.timelineEvents.push({ t: Date.now(), ...evt });
+  // Keep only last 100 timeline events to reduce memory
+  if (room.timelineEvents.length > 100) {
+    room.timelineEvents.splice(0, room.timelineEvents.length - 100);
+  }
+  // Save to Supabase for long-term persistence
+  saveTimelineEvent(room.code, evt.type, evt).catch(e => {
+    console.error('Failed to save timeline event to Supabase:', e);
+  });
 }
 
 function assignPlayerColors(room) {
@@ -404,11 +423,17 @@ function isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effe
   });
 }
 
-async function fetchOsmBaliseCandidates(center, radiusM) {
+async function fetchOsmBaliseCandidates(center, radiusM, maxRetries = 2) {
+  if (!isValidCoordinates(center.lat, center.lng)) {
+    console.warn('Invalid coordinates for OSM balise candidates:', center);
+    return { walkways: [], crossingNodes: [], blockedAreas: [] };
+  }
+
   const radius = overpassRadiusM(radiusM);
   const key = osmCacheKey(center, radius);
   const cached = osmBaliseCache.get(key);
   if (cached && Date.now() - cached.at < OSM_BALISE_CACHE_TTL_MS) return cached.data;
+
   const query = `[out:json][timeout:8];
 (
   // Voies 100% piétonnes
@@ -433,36 +458,58 @@ async function fetchOsmBaliseCandidates(center, radiusM) {
   way(around:${radius},${center.lat},${center.lng})["building"];
 );
 out center geom;`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 9000);
-  try {
-    const res = await fetch(OVERPASS_URL, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded;charset=UTF-8" },
-      body: `data=${encodeURIComponent(query)}`,
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`Overpass ${res.status}`);
-    const json = await res.json();
-    const elements = Array.isArray(json.elements) ? json.elements : [];
-    const isAccessibleWay = (x) => x.type === "way" && x.geometry?.length && (
-      (x.tags?.highway && /^(footway|path|pedestrian|steps|corridor|crossing)$/.test(x.tags.highway)) ||
-      (x.tags?.footway === "crossing") ||
-      (typeof x.tags?.sidewalk === "string" && /^(both|left|right|yes|separate)$/.test(x.tags.sidewalk)) ||
-      (x.tags?.leisure && (/^(stadium|park|playground|sports_centre|pitch)$/.test(x.tags.leisure)) && (x.tags.leisure !== "pitch" || x.tags.surface !== "asphalt")) ||
-      (x.tags?.landuse && /^(grass|meadow|recreation_ground|village_green)$/.test(x.tags.landuse))
-    );
-    const crossingNodes = elements.filter((x) => x.type === "node" && x.tags?.highway === "crossing" && Number.isFinite(x.lat) && Number.isFinite(x.lon));
-    const walkways = elements.filter(isAccessibleWay);
-    const blockedAreas = elements.filter((x) => x.type === "way" && (
-      x.tags?.landuse === "residential" || x.tags?.building || /^(school|university|college)$/.test(x.tags?.amenity || "")
-    ) && x.geometry?.length >= 3);
-    const data = { walkways, crossingNodes, blockedAreas };
-    osmBaliseCache.set(key, { at: Date.now(), data });
-    return data;
-  } finally {
-    clearTimeout(timeout);
+
+  // Try each Overpass endpoint with retries
+  for (const overpassUrl of OVERPASS_URLS) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 9000);
+      try {
+        const res = await fetch(overpassUrl, {
+          method: "POST",
+          headers: { 
+            "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "accept": "application/json"
+          },
+          body: `data=${encodeURIComponent(query)}`,
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`Overpass ${res.status} from ${overpassUrl}`);
+        const json = await res.json();
+        const elements = Array.isArray(json.elements) ? json.elements : [];
+        const isAccessibleWay = (x) => x.type === "way" && x.geometry?.length && (
+          (x.tags?.highway && /^(footway|path|pedestrian|steps|corridor|crossing)$/.test(x.tags.highway)) ||
+          (x.tags?.footway === "crossing") ||
+          (typeof x.tags?.sidewalk === "string" && /^(both|left|right|yes|separate)$/.test(x.tags.sidewalk)) ||
+          (x.tags?.leisure && (/^(stadium|park|playground|sports_centre|pitch)$/.test(x.tags.leisure)) && (x.tags.leisure !== "pitch" || x.tags.surface !== "asphalt")) ||
+          (x.tags?.landuse && /^(grass|meadow|recreation_ground|village_green)$/.test(x.tags.landuse))
+        );
+        const crossingNodes = elements.filter((x) => x.type === "node" && x.tags?.highway === "crossing" && Number.isFinite(x.lat) && Number.isFinite(x.lon));
+        const walkways = elements.filter(isAccessibleWay);
+        const blockedAreas = elements.filter((x) => x.type === "way" && (
+          x.tags?.landuse === "residential" || x.tags?.building || /^(school|university|college)$/.test(x.tags?.amenity || "")
+        ) && x.geometry?.length >= 3);
+        const data = { walkways, crossingNodes, blockedAreas };
+        osmBaliseCache.set(key, { at: Date.now(), data });
+        console.log(`Successfully fetched OSM data from ${overpassUrl}`);
+        return data;
+      } catch (error) {
+        if (attempt === maxRetries) {
+          console.warn(`Overpass API failed after ${maxRetries + 1} attempts on ${overpassUrl}:`, error?.message || error);
+          // Try next endpoint
+          break;
+        }
+        // Exponential backoff: 1s, 2s, 4s...
+        await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
   }
+  
+  // All endpoints failed, return empty data
+  console.warn('All Overpass endpoints failed, using fallback');
+  return { walkways: [], crossingNodes: [], blockedAreas: [] };
 }
 
 async function pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM) {
@@ -559,7 +606,7 @@ async function spawnBalise(room, spawnAt = null) {
     placementHint: position.source === "osm" ? "osm_pedestrian_way" : position.source || "fallback_random",
     osmWayId: position.osmWayId || null,
     createdAt: Date.now(),
-    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes lifetime
+    // Remove expiration - balises should stay until captured or game ends
     capturedBy: null,
     captureProgress: 0,
     beingCapturedBy: null,
@@ -576,14 +623,14 @@ function updateBalises(room, io) {
   if (room.phase !== "playing") return;
   
   const now = Date.now();
-  const baliseSpawnInterval = 5 * 60 * 1000; // 5 minutes
+  const baliseSpawnInterval = 2 * 60 * 1000; // 2 minutes
   
-  // Spawn new balise every 5 minutes OR if no balise exists
+  // Spawn new balise every 2 minutes OR if no balise exists
   if (!room.lastBaliseSpawnAt || now - room.lastBaliseSpawnAt >= baliseSpawnInterval || room.balises.length === 0) {
     if (!room.baliseSpawnPending) {
       room.baliseSpawnPending = true;
-  room.lastBaliseSpawnAt = now;
-  spawnBalise(room, room.lastBaliseSpawnAt)
+      room.lastBaliseSpawnAt = now;
+      spawnBalise(room, room.lastBaliseSpawnAt)
         .catch((e) => {
           console.warn("Erreur création balise:", e?.message || e);
         })
@@ -593,21 +640,11 @@ function updateBalises(room, io) {
     }
   }
   
-  // Update balise capture progress and check expiration
-  const captureTime = 30 * 1000; // 30 seconds
+  // Update balise capture progress
+  const captureTime = 20 * 1000; // 20 seconds
   const toRemove = [];
   
   for (const balise of room.balises) {
-    // Remove expired balises
-    if (balise.expiresAt && now >= balise.expiresAt) {
-      toRemove.push(balise.id);
-      pushTimeline(room, {
-        type: "balise_expired",
-        baliseId: balise.id,
-      });
-      continue;
-    }
-    
     if (balise.capturedBy) {
       toRemove.push(balise.id);
       continue;
@@ -616,7 +653,7 @@ function updateBalises(room, io) {
     let currentPlayerInside = null;
     
     for (const p of room.players.values()) {
-      if (p.role !== "player" || p.captured || p.spectator) continue;
+      if ((p.role !== "player" && p.role !== "cat") || p.captured || p.spectator) continue;
       if (p.lat == null || p.lng == null) continue;
       
       const distance = haversineMeters(p.lat, p.lng, balise.lat, balise.lng);
@@ -627,6 +664,23 @@ function updateBalises(room, io) {
     }
     
     if (currentPlayerInside) {
+      // Vérifier si la balise est déjà capturée ou en cours de capture par un autre joueur
+      if (balise.beingCapturedBy && balise.beingCapturedBy !== currentPlayerInside.sessionId) {
+        // Envoyer une notification au joueur qui tente de capturer
+        try {
+          if (io && room.code) {
+            io.to(room.code).emit("balise_capture_blocked", {
+              sessionId: currentPlayerInside.sessionId,
+              message: "La balise est déjà en cours de capture, vous ne pouvez pas la capturer."
+            });
+          }
+        } catch (e) {
+          console.warn('Failed to emit balise_capture_blocked socket event:', e?.message || e);
+        }
+        // Ne pas permettre la capture
+        continue;
+      }
+      
       if (balise.beingCapturedBy === currentPlayerInside.sessionId) {
         balise.captureProgress += 1000; // Add 1 second (called every second)
       } else {
@@ -637,6 +691,7 @@ function updateBalises(room, io) {
       if (balise.captureProgress >= captureTime) {
         balise.capturedBy = currentPlayerInside.sessionId;
         const award = 20; // Award 20 coins per user request
+        // Award coins to both players and cats
         currentPlayerInside.coins = (currentPlayerInside.coins || 0) + award;
         recordCoinTransaction(currentPlayerInside, award, "balise", "Capture de balise");
         pushTimeline(room, {
@@ -644,6 +699,7 @@ function updateBalises(room, io) {
           baliseId: balise.id,
           sessionId: currentPlayerInside.sessionId,
           nickname: currentPlayerInside.nickname,
+          role: currentPlayerInside.role,
           awardedCoins: award,
         });
         try {
@@ -653,6 +709,7 @@ function updateBalises(room, io) {
               baliseId: balise.id,
               sessionId: currentPlayerInside.sessionId,
               nickname: currentPlayerInside.nickname,
+              role: currentPlayerInside.role,
               awardedCoins: award,
             });
           }
@@ -670,6 +727,18 @@ function updateBalises(room, io) {
   // Remove captured or expired balises
   if (toRemove.length > 0) {
     room.balises = room.balises.filter(b => !toRemove.includes(b.id));
+    // Immediately spawn a new balise if one was captured
+    if (!room.baliseSpawnPending) {
+      room.baliseSpawnPending = true;
+      room.lastBaliseSpawnAt = now;
+      spawnBalise(room, room.lastBaliseSpawnAt)
+        .catch((e) => {
+          console.warn("Erreur création balise après capture:", e?.message || e);
+        })
+        .finally(() => {
+          room.baliseSpawnPending = false;
+        });
+    }
   }
 }
 
@@ -719,6 +788,23 @@ function effectiveGlobalRadiusAtTimestamp(room, absT) {
   }
 }
 
+function calculateWaitTimeToExclude(gameDurationMs) {
+  if (!gameDurationMs || gameDurationMs <= 0) return 0;
+  
+  const baseWaitTimeMs = 5 * 60 * 1000; // 5 minutes
+  const shortGameThresholdMs = 50 * 60 * 1000; // 50 minutes
+  const maxExclusionRatio = 0.10; // 10%
+  
+  // Si la partie dure moins de 50 minutes, ajuster proportionnellement
+  if (gameDurationMs < shortGameThresholdMs) {
+    const maxExclusionMs = gameDurationMs * maxExclusionRatio;
+    return Math.min(baseWaitTimeMs, maxExclusionMs);
+  }
+  
+  // Sinon, exclure les 5 minutes complètes
+  return baseWaitTimeMs;
+}
+
 function computePlayerAnalytics(room, timeline) {
   const trace = room.traceBySession || {};
   const metrics = {};
@@ -735,6 +821,10 @@ function computePlayerAnalytics(room, timeline) {
   const effectiveEnd = finishedAt != null ? finishedAt : Date.now();
   const gameDurationMs =
     huntStart != null ? Math.max(0, effectiveEnd - huntStart) : null;
+  
+  // Calculer le temps d'attente à exclure
+  const waitTimeToExcludeMs = calculateWaitTimeToExclude(gameDurationMs);
+  
   let totalDistance = 0;
 
   for (const [sid, points] of Object.entries(trace)) {
@@ -823,7 +913,20 @@ function computePlayerAnalytics(room, timeline) {
         lastKnownPosition: null,
       };
     }
-    const catTime = player.catTimeMs || 0;
+    let catTime = player.catTimeMs || 0;
+    
+    // Exclure le temps d'attente initial pour le premier chat
+    const isFirstCat = player.originalRole === "cat";
+    if (isFirstCat && waitTimeToExcludeMs > 0) {
+      catTime = Math.max(0, catTime - waitTimeToExcludeMs);
+    }
+    
+    // Exclure le temps d'attente forcé après capture (pour parties à 2 joueurs)
+    const forcedWaitTimeMs = player.forcedWaitTimeMs || 0;
+    if (forcedWaitTimeMs > 0) {
+      catTime = Math.max(0, catTime - forcedWaitTimeMs);
+    }
+    
     totalCatTimeMs += catTime;
     const playerEvents = eventsBySession[sid] || [];
     metrics[sid] = {
@@ -1181,6 +1284,43 @@ export function createRoomsStore({
             room.hostId = socketId;
           }
           console.log(`Reconnexion dans ${room.code} · ${foundPlayer.nickname}`);
+          
+          // Restore active powers from Supabase
+          getActivePowers(room.code, foundPlayer.sessionId).then(powers => {
+            const now = Date.now();
+            for (const power of powers) {
+              const powerType = power.power_type;
+              const powerData = power.power_data;
+              const endsAt = new Date(power.ends_at).getTime();
+              
+              if (endsAt <= now) continue; // Skip expired powers
+              
+              if (powerType === "noise") {
+                foundPlayer.noiseEffect = {
+                  startedAt: new Date(power.started_at).getTime(),
+                  durationSec: powerData.durationSec,
+                  volume: powerData.volume,
+                  by: powerData.by
+                };
+              } else if (powerType === "invisibility") {
+                foundPlayer.invisUntil = endsAt;
+                foundPlayer.invisSince = new Date(power.started_at).getTime();
+                foundPlayer.invisFrozenLat = foundPlayer.lat;
+                foundPlayer.invisFrozenLng = foundPlayer.lng;
+                foundPlayer.invisUsedBy = powerData.usedBy;
+              } else if (powerType === "freeze") {
+                foundPlayer.movementLockedUntil = Math.max(Number(foundPlayer.movementLockedUntil || 0), endsAt);
+              } else if (powerType === "fake_position") {
+                // Cannot restore fake position without current location
+                // Skip restoration for fake_position
+              }
+            }
+            // Broadcast updated state to restore powers on client
+            if (io && room.code) {
+              io.to(room.code).emit("state", buildPlayingState(room, foundPlayer.sessionId));
+            }
+          }).catch(e => console.error('Failed to restore active powers from Supabase:', e));
+          
           return { room, player: foundPlayer, isRejoin: true };
         }
       }
@@ -1572,7 +1712,18 @@ export function createRoomsStore({
     }).catch((err) => {
       console.error('Failed to save game summary to Supabase:', err);
     });
-    
+
+    // Delete room from active_rooms in Supabase since it's finished
+    deleteActiveRoom(room.code).catch(e => {
+      console.error('Failed to delete active room from Supabase:', e);
+    });
+
+    // Schedule room deletion from memory after a short delay (to allow clients to receive game_finished)
+    setTimeout(() => {
+      rooms.delete(room.code);
+      console.log(`Room ${room.code} removed from memory after finishing`);
+    }, 5000);
+
     io.to(room.code).emit("game_finished", summary);
   }
 
@@ -1765,6 +1916,7 @@ export function createRoomsStore({
       room.settings.timeLimitEnabled && huntStartedAt
         ? Math.max(1, Number(room.settings.timeLimitMinutes) || 30) * 60 * 1000
         : null;
+    const now = Date.now();
 
     const others = [...room.players.values()].filter(
       (p) => p.socketId !== viewerSocketId
@@ -1863,7 +2015,6 @@ export function createRoomsStore({
       };
     }
 
-    const now = Date.now();
     for (const p of others) {
       // Check if this player has an active fake position
       const hasFakePosition = p.fakePosition && now < p.fakePosition.until;
@@ -2143,6 +2294,27 @@ export function createRoomsStore({
     if (cat.lat == null || cat.lng == null) {
       return { error: "Position du chat inconnue." };
     }
+    
+    // Compter le nombre de joueurs actifs (non spectateurs)
+    const activePlayerCount = countActivePlayers(room, io);
+    
+    // Anti-revanche pour 3 joueurs : vérifier si le chat essaie de capturer celui qui vient de le capturer
+    if (activePlayerCount === 3) {
+      if (!room.revengeCooldowns) room.revengeCooldowns = new Map();
+      const cooldownKey = `${cat.sessionId}-${targetSessionId}`;
+      const cooldownEnd = room.revengeCooldowns.get(cooldownKey);
+      if (cooldownEnd && Date.now() < cooldownEnd) {
+        const remainingSeconds = Math.ceil((cooldownEnd - Date.now()) / 1000);
+        return { error: `Attendez ${remainingSeconds}s avant de pouvoir capturer à nouveau ce joueur.` };
+      }
+    }
+    
+    // Vérifier si le chat est en délai d'attente (pour 2 joueurs)
+    if (cat.captureCooldownUntil && Date.now() < cat.captureCooldownUntil) {
+      const remainingSeconds = Math.ceil((cat.captureCooldownUntil - Date.now()) / 1000);
+      return { error: `Attendez ${remainingSeconds}s avant de pouvoir capturer.` };
+    }
+    
     let prey = null;
     for (const p of room.players.values()) {
       if (p.sessionId === targetSessionId && p.role === "player" && !p.captured) {
@@ -2185,6 +2357,29 @@ export function createRoomsStore({
       prey.jamCircleCenter = null;
       prey.jamAnchorLat = null;
       prey.jamAnchorLng = null;
+      
+      // Appliquer les règles selon le nombre de joueurs
+      if (activePlayerCount === 2) {
+        // Délai d'attente de 1 minute pour 2 joueurs
+        prey.captureCooldownUntil = now + 60 * 1000; // 1 minute
+        prey.forcedWaitTimeMs = 60 * 1000; // Pour exclusion des stats
+        io.to(code).emit("capture_cooldown", {
+          sessionId: prey.sessionId,
+          cooldownSeconds: 60,
+          reason: "2_players_wait"
+        });
+      } else if (activePlayerCount === 3) {
+        // Anti-revanche pour 3 joueurs : cooldown entre les mêmes joueurs
+        if (!room.revengeCooldowns) room.revengeCooldowns = new Map();
+        const cooldownKey = `${prey.sessionId}-${cat.sessionId}`;
+        const revengeCooldownDuration = 30 * 1000; // 30 secondes
+        room.revengeCooldowns.set(cooldownKey, now + revengeCooldownDuration);
+        io.to(code).emit("revenge_cooldown", {
+          hunterSessionId: prey.sessionId,
+          targetSessionId: cat.sessionId,
+          cooldownSeconds: 30
+        });
+      }
     } else {
       prey.captured = false;
       prey.role = "cat";
@@ -2619,9 +2814,22 @@ export function createRoomsStore({
     }
     if (!room.partyChat) room.partyChat = [];
     room.partyChat.push(entry);
-    if (room.partyChat.length > 400) {
-      room.partyChat.splice(0, room.partyChat.length - 400);
+    // Keep only last 50 chat messages to reduce memory
+    if (room.partyChat.length > 50) {
+      room.partyChat.splice(0, room.partyChat.length - 50);
     }
+    // Save to Supabase for long-term persistence
+    saveGameMessage(
+      room.code,
+      entry.sessionId,
+      entry.nickname,
+      entry.text || entry.image || '', // Use text or image as message content
+      entry.type || 'text',
+      entry.lat || null,
+      entry.lng || null
+    ).catch(e => {
+      console.error('Failed to save game message to Supabase:', e);
+    });
     io.to(room.code).emit("party_chat", entry);
     return { ok: true, entry };
   }
@@ -2739,6 +2947,23 @@ export function createRoomsStore({
           volume,
           by: actor.nickname
         };
+        // Send game notification only to the impacted player
+        sock?.emit("game_notification", {
+          kind: "noise",
+          durationSec,
+          volume,
+          by: actor.nickname
+        });
+        // Save to Supabase for persistence
+        saveActivePower(
+          room.code,
+          t.sessionId,
+          t.nickname,
+          "noise",
+          { durationSec, volume, by: actor.nickname },
+          now,
+          now + durationSec * 1000
+        ).catch(e => console.error('Failed to save noise power to Supabase:', e));
       }
 
       pushTimeline(room, {
@@ -2792,9 +3017,43 @@ export function createRoomsStore({
         t.invisSince = now;
         t.invisFrozenLat = t.lat;
         t.invisFrozenLng = t.lng;
+        // Store who used the power on this target
+        t.invisUsedBy = actor.sessionId;
+        // Save to Supabase for persistence
+        saveActivePower(
+          room.code,
+          t.sessionId,
+          t.nickname,
+          "invisibility",
+          { scope, usedBy: actor.sessionId, usedByNickname: actor.nickname },
+          now,
+          until
+        ).catch(e => console.error('Failed to save invisibility power to Supabase:', e));
       }
       pushTimeline(room, { type: "power_invisibility", bySessionId: actor.sessionId, scope, count: targets.length, durationSec });
       setCooldown(actor, "invisibility", 120);
+      
+      // Send game notification to the actor (the one who used the power)
+      const actorSock = io.sockets.sockets.get(actor.socketId);
+      if (actorSock) {
+        if (scope === "self") {
+          actorSock.emit("game_notification", {
+            kind: "invisibility",
+            scope: "self",
+            durationSec
+          });
+        } else {
+          // For single/multi/all_role, show the names of targets
+          const targetNames = targets.map(t => t.nickname).join(", ");
+          actorSock.emit("game_notification", {
+            kind: "invisibility",
+            scope: "other",
+            targetNames,
+            durationSec
+          });
+        }
+      }
+      
       broadcastPlayingState(io, room);
       return { ok: true };
     }
@@ -2808,6 +3067,8 @@ export function createRoomsStore({
       actor.invisSince = null;
       actor.invisFrozenLat = null;
       actor.invisFrozenLng = null;
+      // Remove from Supabase
+      removeActivePower(room.code, actor.sessionId, "invisibility").catch(e => console.error('Failed to remove invisibility power from Supabase:', e));
       pushTimeline(room, { type: "power_invisibility_end", bySessionId: actor.sessionId });
       broadcastPlayingState(io, room);
       return { ok: true };
@@ -2925,6 +3186,16 @@ export function createRoomsStore({
         t.movementLockedUntil = Math.max(Number(t.movementLockedUntil || 0), until);
         const sock = io.sockets.sockets.get(t.socketId);
         sock?.emit("immobilized", { until, by: actor.nickname, durationSec });
+        // Save to Supabase for persistence
+        saveActivePower(
+          room.code,
+          t.sessionId,
+          t.nickname,
+          "freeze",
+          { by: actor.nickname, durationSec },
+          now,
+          until
+        ).catch(e => console.error('Failed to save freeze power to Supabase:', e));
       }
       pushTimeline(room, { type: "power_freeze_cats", bySessionId: actor.sessionId, scope, count: targets.length, durationSec });
       setCooldown(actor, "freeze_cats", 90);
@@ -2959,6 +3230,16 @@ export function createRoomsStore({
         jamCircleCenter: { lat: actor.lat, lng: actor.lng },
         jamCircleLastUpdate: now,
       };
+      // Save to Supabase for persistence
+      saveActivePower(
+        room.code,
+        actor.sessionId,
+        actor.nickname,
+        "fake_position",
+        { durationSec },
+        now,
+        now + durationSec * 1000
+      ).catch(e => console.error('Failed to save fake_position power to Supabase:', e));
 
       pushTimeline(room, { type: "power_fake_position", bySessionId: actor.sessionId, durationSec });
       setCooldown(actor, "fake_position", 180);
@@ -2973,6 +3254,8 @@ export function createRoomsStore({
       }
       
       actor.fakePosition = null;
+      // Remove from Supabase
+      removeActivePower(room.code, actor.sessionId, "fake_position").catch(e => console.error('Failed to remove fake_position power from Supabase:', e));
       pushTimeline(room, { type: "power_fake_position_end", bySessionId: actor.sessionId });
       broadcastPlayingState(io, room);
       return { ok: true };

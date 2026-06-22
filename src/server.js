@@ -6,6 +6,7 @@ import { Server } from "socket.io";
 import { createRoomsStore } from "./rooms.js";
 import { corsOriginOption } from "./corsConfig.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+import { saveActiveRoom, getActiveRooms, deleteActiveRoom, saveSession, deleteSession } from "./supabase.js";
 
 const PORT = Number(process.env.PORT) || 3001;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -16,6 +17,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL || process.env.SUPABASE_URL_PUBLIC
 const SUPABASE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
   process.env.SUPABASE_ANON_KEY ||
+  process.env.SUPABASE_KEY ||
   process.env.API ||
   "";
 const supabase = SUPABASE_URL && SUPABASE_KEY ? createSupabaseClient(SUPABASE_URL, SUPABASE_KEY) : null;
@@ -100,30 +102,137 @@ const store = createRoomsStore({
   onRoomNuked: () => {},
 });
 
-// Update balises every second
+// Restore active rooms from Supabase on server startup
+async function restoreActiveRooms() {
+  if (!supabase) {
+    console.log("Supabase not configured, skipping room restoration");
+    return;
+  }
+
+  try {
+    console.log("Restoring active rooms from Supabase...");
+    const activeRooms = await getActiveRooms();
+    console.log(`Found ${activeRooms.length} active rooms to restore`);
+
+    for (const { code, data } of activeRooms) {
+      try {
+        // Convert players array back to Map and clear invalid socketIds
+        // Use sessionId as temporary key since socketId is invalid after crash
+        const playersMap = new Map();
+        for (const [socketId, player] of data.players) {
+          // Clear socketId as it's invalid after crash
+          // Use sessionId as temporary key
+          playersMap.set(player.sessionId, {
+            ...player,
+            socketId: null, // Will be set on reconnection
+          });
+        }
+
+        const roomData = {
+          ...data,
+          players: playersMap,
+        };
+
+        // Restore the room in the store
+        // Note: This is a simplified restoration - in production, you might need
+        // to handle socket reconnections, timers, etc.
+        store.rooms.set(code, roomData);
+        console.log(`Restored room ${code} with ${roomData.players.size} players`);
+
+        // Restore sessions WITHOUT socketId (invalid after crash)
+        // SocketId will be updated when player reconnects
+        for (const [sessionId, player] of roomData.players) {
+          sessionRegistry.set(sessionId, {
+            socketId: null, // Will be set on reconnection
+            roomCode: code,
+            nickname: player.nickname,
+          });
+        }
+      } catch (e) {
+        console.error(`Failed to restore room ${code}:`, e);
+        // Clean up failed restoration
+        await deleteActiveRoom(code);
+      }
+    }
+
+    console.log("Room restoration complete");
+  } catch (e) {
+    console.error("Failed to restore active rooms:", e);
+  }
+}
+
+// Start restoration after a short delay to ensure everything is initialized
+setTimeout(() => {
+  restoreActiveRooms();
+}, 1000);
+
+// Graceful shutdown: save all active rooms before closing
+async function gracefulShutdown() {
+  console.log('Starting graceful shutdown...');
+
+  if (supabase) {
+    try {
+      console.log('Saving all active rooms to Supabase...');
+      for (const [code, room] of store.rooms || []) {
+        if (room.phase !== "finished") {
+          try {
+            const roomData = {
+              ...room,
+              players: Array.from(room.players.entries()),
+            };
+            await saveActiveRoom(roomData);
+            console.log(`Saved room ${code} to Supabase`);
+          } catch (e) {
+            console.error(`Failed to save room ${code} to Supabase:`, e);
+          }
+        }
+      }
+      console.log('All active rooms saved to Supabase');
+    } catch (e) {
+      console.error('Error during graceful shutdown:', e);
+    }
+  }
+
+  console.log('Graceful shutdown complete');
+  process.exit(0);
+}
+
+// Handle shutdown signals
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
+// Update balises every 2 seconds (reduced from 1s to lower load)
 setInterval(() => {
   for (const [code, room] of store.rooms || []) {
     if (room.phase === "playing") {
       store.broadcastPlayingState(io, room);
     }
   }
-}, 1000);
+}, 2000);
+
+// Save active rooms to Supabase every 30 seconds (for crash recovery)
+setInterval(async () => {
+  if (!supabase) return;
+  for (const [code, room] of store.rooms || []) {
+    if (room.phase !== "finished") {
+      try {
+        // Convert Map to plain object for JSON serialization
+        const roomData = {
+          ...room,
+          players: Array.from(room.players.entries()),
+        };
+        await saveActiveRoom(roomData);
+      } catch (e) {
+        console.error(`Failed to save room ${code} to Supabase:`, e);
+      }
+    }
+  }
+}, 30000);
 
 // Map sessionId -> { socketId, roomCode, nickname, ... } pour la reconnexion
 const sessionRegistry = new Map();
 
 io.on("connection", (socket) => {
-  // Heartbeat: envoie ping toutes les 30s, le client doit repondre pong
-  const heartbeatInterval = setInterval(() => {
-    socket.emit("server_ping", { t: Date.now() });
-  }, 30000);
-
-  socket.on("client_pong", () => {
-    // Le client est vivant
-  });
-
-
-
   // Reconnexion avec sessionId existant
   socket.on("reconnect_session", ({ sessionId, roomCode }, cb) => {
     try {
@@ -142,9 +251,11 @@ io.on("connection", (socket) => {
 
       // Trouver l'ancien joueur par sessionId et mettre a jour son socketId
       let foundPlayer = null;
-      for (const p of room.players.values()) {
+      let oldKey = null;
+      for (const [key, p] of room.players.entries()) {
         if (p.sessionId === sessionId) {
           foundPlayer = p;
+          oldKey = key;
           break;
         }
       }
@@ -162,9 +273,11 @@ io.on("connection", (socket) => {
         if (oldSocket) {
           oldSocket.leave(room.code);
         }
-        room.players.delete(oldSocketId);
         store.socketToRoom.delete(oldSocketId);
       }
+
+      // Supprimer l'ancienne entrée (peut être sessionId ou socketId)
+      room.players.delete(oldKey);
 
       // Mettre a jour avec le nouveau socket
       foundPlayer.socketId = socket.id;
@@ -184,6 +297,12 @@ io.on("connection", (socket) => {
       const isHost = room.hostId === oldSocketId;
       if (isHost) {
         room.hostId = socket.id;
+      }
+
+      // Restore admin role if player was admin
+      if (foundPlayer.role === "admin") {
+        // Ensure admin role is preserved
+        console.log(`Restoring admin role for player ${foundPlayer.nickname}`);
       }
 
       // Envoyer l'etat actuel selon la phase
@@ -235,6 +354,10 @@ io.on("connection", (socket) => {
         roomCode: room.code,
         nickname: player.nickname,
       });
+      // Save session to Supabase for crash recovery
+      saveSession(player.sessionId, socket.id, room.code, player.nickname).catch(e => {
+        console.error('Failed to save session to Supabase:', e);
+      });
 
       const payload = store.buildLobbyPayload(room, io);
       io.to(room.code).emit("lobby_update", payload);
@@ -270,6 +393,10 @@ io.on("connection", (socket) => {
       socketId: socket.id,
       roomCode: room.code,
       nickname: player.nickname,
+    });
+    // Save session to Supabase for crash recovery
+    saveSession(player.sessionId, socket.id, room.code, player.nickname).catch(e => {
+      console.error('Failed to save session to Supabase:', e);
     });
 
     const isHost = room.hostId === socket.id;
@@ -522,6 +649,10 @@ io.on("connection", (socket) => {
     const player = room ? room.players.get(socket.id) : null;
     if (player?.sessionId) {
       sessionRegistry.delete(player.sessionId);
+      // Delete session from Supabase
+      deleteSession(player.sessionId).catch(e => {
+        console.error('Failed to delete session from Supabase:', e);
+      });
     }
 
     const r = store.leaveRoomVoluntarily(io, socket.id);
@@ -530,8 +661,6 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    clearInterval(heartbeatInterval);
-
     const code = store.socketToRoom.get(socket.id);
     if (!code) return;
 

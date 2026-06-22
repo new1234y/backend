@@ -69,9 +69,10 @@ export function isInsideRadius(lat, lon, center, radiusM) {
  * Anneau fermé [[lat,lng], ...] — point dans polygone (rayon horizontal vers l'est).
  */
 export function pointInRing(lat, lon, ring) {
-  console.log('[pointInRing] Called with:', { lat, lon, ringLength: ring?.length });
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return false;
+  }
   if (!ring || ring.length < 3) {
-    console.log('[pointInRing] Invalid ring, returning false');
     return false;
   }
   let inside = false;
