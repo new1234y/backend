@@ -9,9 +9,11 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.106.2",
+    "better-sqlite3": "^12.11.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
+    "osm-read": "^0.7.0",
     "socket.io": "^4.7.5",
     "uuid": "^10.0.0"
   }

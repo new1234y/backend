@@ -879,9 +879,9 @@ function computePlayerAnalytics(room, timeline) {
   const effectiveEnd = finishedAt != null ? finishedAt : Date.now();
   const gameDurationMs =
     huntStart != null ? Math.max(0, effectiveEnd - huntStart) : null;
-  
-  // Calculer le temps d'attente à exclure
-  const waitTimeToExcludeMs = calculateWaitTimeToExclude(gameDurationMs);
+
+  // Use the actual initial cat delay from the room if available, otherwise calculate
+  const waitTimeToExcludeMs = room.initialCatDelayMs || calculateWaitTimeToExclude(gameDurationMs);
   
   let totalDistance = 0;
 
@@ -972,13 +972,12 @@ function computePlayerAnalytics(room, timeline) {
       };
     }
     let catTime = player.catTimeMs || 0;
-    
-    // Exclure le temps d'attente initial pour le premier chat
-    const isFirstCat = player.originalRole === "cat";
-    if (isFirstCat && waitTimeToExcludeMs > 0) {
+
+    // Exclure le temps d'attente initial pour tous les chats (la carte est verrouillée pour tous)
+    if (waitTimeToExcludeMs > 0) {
       catTime = Math.max(0, catTime - waitTimeToExcludeMs);
     }
-    
+
     // Exclure le temps d'attente forcé après capture (pour parties à 2 joueurs)
     const forcedWaitTimeMs = player.forcedWaitTimeMs || 0;
     if (forcedWaitTimeMs > 0) {
@@ -1729,6 +1728,7 @@ export function createRoomsStore({
     const manualDelayMs = Math.max(0, Number(room.settings.catDelayMinutes) || 0) * 60 * 1000;
     const delayMs = manualDelayMs > 0 ? manualDelayMs : dynamicDelayMs;
     room.catMapUnlockAt = Date.now() + delayMs;
+    room.initialCatDelayMs = delayMs; // Store for analytics exclusion
     console.log(`Chasse démarrée (${room.code}) · carte chats vers ${new Date(room.catMapUnlockAt).toLocaleTimeString()} (délai: ${Math.round(delayMs / 1000 / 60)}min)`);
     return { ok: true, room };
   }
