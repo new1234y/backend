@@ -8,6 +8,33 @@ import { corsOriginOption } from "./corsConfig.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import { saveActiveRoom, getActiveRooms, deleteActiveRoom, saveSession, deleteSession } from "./supabase.js";
 
+// Simple rate limiting for Socket.io events
+const rateLimiter = new Map();
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const RATE_LIMIT_MAX = 100; // Max 100 events per minute per socket
+
+function checkRateLimit(socketId, eventName) {
+  const key = `${socketId}:${eventName}`;
+  const now = Date.now();
+  const windowStart = now - RATE_LIMIT_WINDOW;
+  
+  if (!rateLimiter.has(key)) {
+    rateLimiter.set(key, []);
+  }
+  
+  const events = rateLimiter.get(key);
+  // Remove old events outside the window
+  const recentEvents = events.filter(t => t > windowStart);
+  rateLimiter.set(key, recentEvents);
+  
+  if (recentEvents.length >= RATE_LIMIT_MAX) {
+    return false; // Rate limited
+  }
+  
+  recentEvents.push(now);
+  return true;
+}
+
 const PORT = Number(process.env.PORT) || 3001;
 const HOST = process.env.HOST || "0.0.0.0";
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
@@ -563,6 +590,11 @@ io.on("connection", (socket) => {
   });
 
   socket.on("position", ({ lat, lng }) => {
+    // Rate limit position updates to prevent spam
+    if (!checkRateLimit(socket.id, "position")) {
+      return;
+    }
+    
     console.log('[Server] Position received from socket:', socket.id, { lat, lng });
     const ctx = store.setPosition(socket.id, lat, lng);
     if (!ctx) {

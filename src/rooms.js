@@ -1863,6 +1863,43 @@ export function createRoomsStore({
   if (la < -90 || la > 90 || lo < -180 || lo > 180) {
     return null;
   }
+
+  // Enhanced GPS validation: detect spoofed positions by checking movement speed
+  if (p.lat != null && p.lng != null && p.lastPositionUpdate != null) {
+    const now = Date.now();
+    const timeDiffMs = now - p.lastPositionUpdate;
+    const timeDiffSec = timeDiffMs / 1000;
+    
+    // Only validate if time difference is reasonable (between 0.5s and 60s)
+    if (timeDiffSec > 0.5 && timeDiffSec < 60) {
+      const distanceM = haversineMeters(p.lat, p.lng, la, lo);
+      const speedMps = distanceM / timeDiffSec; // meters per second
+      const speedKmh = speedMps * 3.6; // km/h
+      
+      // Maximum realistic speed: 100 km/h (car speed on highway)
+      // Allow some margin for GPS inaccuracy: 120 km/h
+      const MAX_SPEED_KMH = 120;
+      
+      if (speedKmh > MAX_SPEED_KMH) {
+        // Position appears to be spoofed - reject it
+        console.warn(`[GPS Validation] Rejected spoofed position for ${p.nickname}: speed ${speedKmh.toFixed(1)} km/h exceeds ${MAX_SPEED_KMH} km/h`);
+        // Log the suspicious activity
+        pushTimeline(room, {
+          type: "suspicious_movement",
+          sessionId: p.sessionId,
+          nickname: p.nickname,
+          speed: speedKmh.toFixed(1),
+          distance: distanceM.toFixed(0),
+          timeDiff: timeDiffSec.toFixed(1),
+        });
+        // Return old position without updating
+        return { room, player: p };
+      }
+    }
+  }
+  
+  // Update last position timestamp
+  p.lastPositionUpdate = Date.now();
   
   // Check out of bounds status changes
   if (room.phase === "playing" && !p.spectator && !p.captured && room.gameCenter) {
@@ -1911,7 +1948,7 @@ export function createRoomsStore({
   p.lat = la;
   p.lng = lo;
   return { room, player: p };
-  }
+}
 
   function buildLobbyPayload(room, io = null) {
     const host = room.players.get(room.hostId);

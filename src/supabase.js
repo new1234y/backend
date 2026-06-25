@@ -3,14 +3,26 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 
-if (!supabaseUrl || !supabaseKey) {
-  console.error('Missing Supabase credentials');
-  process.exit(1);
+let supabase = null;
+
+if (supabaseUrl && supabaseKey) {
+  try {
+    supabase = createClient(supabaseUrl, supabaseKey);
+    console.log('Supabase client initialized successfully');
+  } catch (error) {
+    console.error('Failed to initialize Supabase client:', error);
+    console.warn('Running in degraded mode without Supabase persistence');
+  }
+} else {
+  console.warn('Supabase credentials not provided. Running in degraded mode without persistence.');
 }
 
-export const supabase = createClient(supabaseUrl, supabaseKey);
-
 export async function saveGameSummary(gameSummary) {
+  if (!supabase) {
+    console.warn('Supabase not available, skipping game summary save');
+    return null;
+  }
+
   try {
     const { data, error } = await supabase
       .from('game_history')
@@ -47,6 +59,11 @@ export async function saveGameSummary(gameSummary) {
 }
 
 export async function getGameHistory(limit = 10) {
+  if (!supabase) {
+    console.warn('Supabase not available, returning empty game history');
+    return [];
+  }
+
   try {
     const { data, error } = await supabase
       .from('game_history')
@@ -67,6 +84,11 @@ export async function getGameHistory(limit = 10) {
 }
 
 export async function getGameByCode(code) {
+  if (!supabase) {
+    console.warn('Supabase not available, cannot fetch game by code');
+    return null;
+  }
+
   try {
     const { data, error } = await supabase
       .from('game_history')
@@ -91,6 +113,10 @@ export async function getGameByCode(code) {
 
 // Active rooms persistence
 export async function saveActiveRoom(roomData) {
+  if (!supabase) {
+    return false;
+  }
+
   try {
     const { error } = await supabase
       .from('active_rooms')
@@ -114,6 +140,10 @@ export async function saveActiveRoom(roomData) {
 }
 
 export async function getActiveRooms() {
+  if (!supabase) {
+    return [];
+  }
+
   try {
     const { data, error } = await supabase
       .from('active_rooms')
@@ -132,6 +162,10 @@ export async function getActiveRooms() {
 }
 
 export async function deleteActiveRoom(code) {
+  if (!supabase) {
+    return false;
+  }
+
   try {
     const { error } = await supabase
       .from('active_rooms')
@@ -151,6 +185,10 @@ export async function deleteActiveRoom(code) {
 
 // Game messages persistence
 export async function saveGameMessage(roomCode, sessionId, nickname, message, type = 'text', lat = null, lng = null) {
+  if (!supabase) {
+    return false;
+  }
+
   try {
     const { error } = await supabase
       .from('game_messages')
@@ -177,6 +215,10 @@ export async function saveGameMessage(roomCode, sessionId, nickname, message, ty
 }
 
 export async function getGameMessages(roomCode, limit = 100) {
+  if (!supabase) {
+    return [];
+  }
+
   try {
     const { data, error } = await supabase
       .from('game_messages')
@@ -199,6 +241,10 @@ export async function getGameMessages(roomCode, limit = 100) {
 
 // Game timeline persistence
 export async function saveTimelineEvent(roomCode, eventType, eventData) {
+  if (!supabase) {
+    return false;
+  }
+
   try {
     const { error } = await supabase
       .from('game_timeline')
@@ -222,6 +268,10 @@ export async function saveTimelineEvent(roomCode, eventType, eventData) {
 
 // Active powers persistence
 export async function saveActivePower(roomCode, sessionId, nickname, powerType, powerData, startedAt, endsAt) {
+  if (!supabase) {
+    return false;
+  }
+
   try {
     const { error } = await supabase
       .from('active_powers')
@@ -247,6 +297,10 @@ export async function saveActivePower(roomCode, sessionId, nickname, powerType, 
 }
 
 export async function removeActivePower(roomCode, sessionId, powerType) {
+  if (!supabase) {
+    return false;
+  }
+
   try {
     const { error } = await supabase
       .from('active_powers')
@@ -267,6 +321,10 @@ export async function removeActivePower(roomCode, sessionId, powerType) {
 }
 
 export async function getActivePowers(roomCode, sessionId) {
+  if (!supabase) {
+    return [];
+  }
+
   try {
     const now = new Date().toISOString();
     const { data, error } = await supabase
@@ -289,6 +347,10 @@ export async function getActivePowers(roomCode, sessionId) {
 }
 
 export async function cleanupExpiredPowers() {
+  if (!supabase) {
+    return false;
+  }
+
   try {
     const { error } = await supabase.rpc('cleanup_expired_powers');
     if (error) {
@@ -303,6 +365,10 @@ export async function cleanupExpiredPowers() {
 }
 
 export async function getGameTimeline(roomCode, limit = 200) {
+  if (!supabase) {
+    return [];
+  }
+
   try {
     const { data, error } = await supabase
       .from('game_timeline')
@@ -325,6 +391,10 @@ export async function getGameTimeline(roomCode, limit = 200) {
 
 // Game sessions persistence
 export async function saveSession(sessionId, socketId, roomCode, nickname) {
+  if (!supabase) {
+    return false;
+  }
+
   try {
     const { error } = await supabase
       .from('game_sessions')
@@ -350,6 +420,10 @@ export async function saveSession(sessionId, socketId, roomCode, nickname) {
 }
 
 export async function getSession(sessionId) {
+  if (!supabase) {
+    return null;
+  }
+
   try {
     const { data, error } = await supabase
       .from('game_sessions')
@@ -373,6 +447,10 @@ export async function getSession(sessionId) {
 }
 
 export async function deleteSession(sessionId) {
+  if (!supabase) {
+    return false;
+  }
+
   try {
     const { error } = await supabase
       .from('game_sessions')
@@ -391,6 +469,10 @@ export async function deleteSession(sessionId) {
 }
 
 export async function getRoomSessions(roomCode) {
+  if (!supabase) {
+    return [];
+  }
+
   try {
     const { data, error } = await supabase
       .from('game_sessions')
