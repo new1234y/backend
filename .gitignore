@@ -1,3 +1,4 @@
 data/idf-osm.db
 pdf/*.osm.pbf
 .env
+.env.example
