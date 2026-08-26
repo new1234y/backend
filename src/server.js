@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import http from "http";
 import cors from "cors";
+import helmet from "helmet";
 import { Server } from "socket.io";
 import { createRoomsStore } from "./rooms.js";
 import { corsOriginOption } from "./corsConfig.js";
@@ -12,6 +13,7 @@ import { saveActiveRoom, getActiveRooms, deleteActiveRoom, saveSession, deleteSe
 const rateLimiter = new Map();
 const RATE_LIMIT_WINDOW = 60000; // 1 minute
 const RATE_LIMIT_MAX = 100; // Max 100 events per minute per socket
+const ADMIN_RATE_LIMIT_MAX = 10; // Max 10 admin actions per minute (stricter)
 
 function checkRateLimit(socketId, eventName) {
   const key = `${socketId}:${eventName}`;
@@ -27,7 +29,11 @@ function checkRateLimit(socketId, eventName) {
   const recentEvents = events.filter(t => t > windowStart);
   rateLimiter.set(key, recentEvents);
   
-  if (recentEvents.length >= RATE_LIMIT_MAX) {
+  // Use stricter limit for admin functions
+  const maxLimit = eventName.startsWith('admin_') ? ADMIN_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
+  
+  if (recentEvents.length >= maxLimit) {
+    console.warn(`Rate limit exceeded for ${eventName} from socket ${socketId}`);
     return false; // Rate limited
   }
   
@@ -47,11 +53,24 @@ const SUPABASE_KEY =
   process.env.SUPABASE_KEY ||
   process.env.API ||
   "";
+
+// SECURITY: Validate Supabase key type in production
+if (process.env.NODE_ENV === 'production' && SUPABASE_KEY) {
+  if (SUPABASE_KEY.startsWith('eyJ') && !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    console.warn('SECURITY: Using anon key in production. Consider using service role key for admin operations.');
+  }
+}
+
 const supabase = SUPABASE_URL && SUPABASE_KEY ? createSupabaseClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
 const app = express();
+// Security headers with Helmet
+app.use(helmet({
+  contentSecurityPolicy: false, // Disabled for WebSocket compatibility
+  crossOriginEmbedderPolicy: false,
+}));
 app.use(cors({ origin: corsOrigin, credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' })); // Limit JSON body size to prevent DoS
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
@@ -372,7 +391,19 @@ io.on("connection", (socket) => {
 
   socket.on("create_room", ({ nickname }, cb) => {
     try {
-      const { room, player } = store.createRoom(socket.id, nickname);
+      // Input validation
+      if (!nickname || typeof nickname !== 'string') {
+        cb?.({ ok: false, error: "Pseudonyme invalide." });
+        return;
+      }
+      if (nickname.length < 1 || nickname.length > 20) {
+        cb?.({ ok: false, error: "Le pseudonyme doit contenir entre 1 et 20 caractères." });
+        return;
+      }
+      // Sanitize nickname to prevent XSS
+      const sanitizedNickname = nickname.trim().replace(/[<>]/g, '');
+      
+      const { room, player } = store.createRoom(socket.id, sanitizedNickname);
       socket.join(room.code);
       
       // Enregistrer la session pour la reconnexion
@@ -402,7 +433,23 @@ io.on("connection", (socket) => {
   });
 
   socket.on("join_room", ({ code, nickname, sessionId: existingSessionId }, cb) => {
-    const result = store.joinRoom(socket.id, code, nickname, existingSessionId);
+    // Input validation
+    if (!code || typeof code !== 'string' || code.length < 3 || code.length > 10) {
+      cb?.({ ok: false, error: "Code de salle invalide." });
+      return;
+    }
+    if (!nickname || typeof nickname !== 'string') {
+      cb?.({ ok: false, error: "Pseudonyme invalide." });
+      return;
+    }
+    if (nickname.length < 1 || nickname.length > 20) {
+      cb?.({ ok: false, error: "Le pseudonyme doit contenir entre 1 et 20 caractères." });
+      return;
+    }
+    // Sanitize nickname to prevent XSS
+    const sanitizedNickname = nickname.trim().replace(/[<>]/g, '');
+    
+    const result = store.joinRoom(socket.id, code, sanitizedNickname, existingSessionId);
     if (result.error) {
       cb?.({
         ok: false,
@@ -541,24 +588,63 @@ io.on("connection", (socket) => {
   });
 
   socket.on("admin_kick", ({ targetSessionId }, cb) => {
+    // Rate limit admin actions
+    if (!checkRateLimit(socket.id, "admin_kick")) {
+      cb?.({ ok: false, error: "Trop de tentatives. Réessayez plus tard." });
+      return;
+    }
+    // Input validation
+    if (!targetSessionId || typeof targetSessionId !== 'string') {
+      cb?.({ ok: false, error: "Paramètre invalide." });
+      return;
+    }
     const r = store.adminKick(io, socket.id, targetSessionId);
     if (r.error) cb?.({ ok: false, error: r.error });
     else cb?.({ ok: true });
   });
 
   socket.on("admin_set_role", ({ targetSessionId, role }, cb) => {
+    // Rate limit admin actions
+    if (!checkRateLimit(socket.id, "admin_set_role")) {
+      cb?.({ ok: false, error: "Trop de tentatives. Réessayez plus tard." });
+      return;
+    }
+    // Input validation
+    if (!targetSessionId || typeof targetSessionId !== 'string') {
+      cb?.({ ok: false, error: "Paramètre invalide." });
+      return;
+    }
+    if (!role || typeof role !== 'string' || !['cat', 'player'].includes(role)) {
+      cb?.({ ok: false, error: "Rôle invalide." });
+      return;
+    }
     const r = store.adminSetRole(io, socket.id, targetSessionId, role);
     if (r.error) cb?.({ ok: false, error: r.error });
     else cb?.({ ok: true });
   });
 
   socket.on("admin_end_game", (_data, cb) => {
+    // Rate limit admin actions
+    if (!checkRateLimit(socket.id, "admin_end_game")) {
+      cb?.({ ok: false, error: "Trop de tentatives. Réessayez plus tard." });
+      return;
+    }
     const r = store.adminEndGame(io, socket.id);
     if (r.error) cb?.({ ok: false, error: r.error });
     else cb?.({ ok: true });
   });
 
   socket.on("admin_add_time", ({ minutes }, cb) => {
+    // Rate limit admin actions
+    if (!checkRateLimit(socket.id, "admin_add_time")) {
+      cb?.({ ok: false, error: "Trop de tentatives. Réessayez plus tard." });
+      return;
+    }
+    // Input validation
+    if (minutes == null || typeof minutes !== 'number' || minutes < 0 || minutes > 120) {
+      cb?.({ ok: false, error: "Durée invalide (0-120 minutes)." });
+      return;
+    }
     const r = store.adminAddTime(io, socket.id, minutes);
     if (r.error) cb?.({ ok: false, error: r.error });
     else cb?.({ ok: true });
@@ -592,6 +678,20 @@ io.on("connection", (socket) => {
   socket.on("position", ({ lat, lng }) => {
     // Rate limit position updates to prevent spam
     if (!checkRateLimit(socket.id, "position")) {
+      return;
+    }
+    
+    // Input validation for GPS coordinates
+    if (lat == null || lng == null || typeof lat !== 'number' || typeof lng !== 'number') {
+      console.warn('[Server] Invalid position data from socket:', socket.id);
+      return;
+    }
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      console.warn('[Server] Non-finite coordinates from socket:', socket.id);
+      return;
+    }
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      console.warn('[Server] Coordinates out of valid range from socket:', socket.id, { lat, lng });
       return;
     }
     
@@ -657,12 +757,36 @@ io.on("connection", (socket) => {
   });
 
   socket.on("admin_set_power_costs", (partialCosts, cb) => {
+    // Rate limit admin actions
+    if (!checkRateLimit(socket.id, "admin_set_power_costs")) {
+      cb?.({ ok: false, error: "Trop de tentatives. Réessayez plus tard." });
+      return;
+    }
+    // Input validation
+    if (!partialCosts || typeof partialCosts !== 'object') {
+      cb?.({ ok: false, error: "Paramètre invalide." });
+      return;
+    }
     const r = store.adminSetPowerCosts(io, socket.id, partialCosts || {});
     if (r.error) cb?.({ ok: false, error: r.error });
     else cb?.({ ok: true });
   });
 
   socket.on("admin_adjust_coins", ({ targetSessionId, delta }, cb) => {
+    // Rate limit admin actions
+    if (!checkRateLimit(socket.id, "admin_adjust_coins")) {
+      cb?.({ ok: false, error: "Trop de tentatives. Réessayez plus tard." });
+      return;
+    }
+    // Input validation
+    if (!targetSessionId || typeof targetSessionId !== 'string') {
+      cb?.({ ok: false, error: "Paramètre invalide." });
+      return;
+    }
+    if (delta == null || typeof delta !== 'number' || !Number.isFinite(delta)) {
+      cb?.({ ok: false, error: "Delta invalide." });
+      return;
+    }
     const r = store.adminAdjustCoins(io, socket.id, targetSessionId, delta);
     if (r.error) cb?.({ ok: false, error: r.error });
     else cb?.({ ok: true, coins: r.coins });

@@ -20,9 +20,16 @@ const OSM_BALISE_CACHE_TTL_MS = 10 * 60 * 1000;
 const osmBaliseCache = new Map();
 
 function isValidCoordinates(lat, lng) {
-  return Number.isFinite(lat) && Number.isFinite(lng) && 
-         lat >= -90 && lat <= 90 && 
-         lng >= -180 && lng <= 180;
+  // Enhanced validation with additional checks
+  if (lat == null || lng == null) return false;
+  if (typeof lat !== 'number' || typeof lng !== 'number') return false;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
+  // Additional check for extreme precision (GPS spoofing detection)
+  const latStr = lat.toString();
+  const lngStr = lng.toString();
+  if (latStr.length > 15 || lngStr.length > 15) return false;
+  return true;
 }
 
 const COLOR_PALETTE = [
@@ -2521,6 +2528,18 @@ export function createRoomsStore({
     if (!room || room.hostId !== hostSocketId) {
       return { error: "Réservé à l'hôte." };
     }
+    // Additional validation: prevent kicking admin role players
+    let target = null;
+    for (const p of room.players.values()) {
+      if (p.sessionId === targetSessionId) {
+        target = p;
+        break;
+      }
+    }
+    if (!target) return { error: "Joueur introuvable." };
+    if (target.role === "admin") {
+      return { error: "Impossible d'expulser un administrateur." };
+    }
     let targetSocket = null;
     for (const p of room.players.values()) {
       if (p.sessionId === targetSessionId) {
@@ -2572,6 +2591,10 @@ export function createRoomsStore({
       }
     }
     if (!target) return { error: "Joueur introuvable." };
+    // Additional validation: prevent changing admin role
+    if (target.role === "admin") {
+      return { error: "Impossible de modifier le rôle d'un administrateur." };
+    }
     const prevRole = target.role;
     const now = Date.now();
     if (prevRole === "cat" && newRole !== "cat" && target.catSince) {
