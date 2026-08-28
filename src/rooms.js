@@ -21,10 +21,16 @@ const osmBaliseCache = new Map();
 
 const BALISE_RADIUS_M = 30;
 const BALISE_TARGET_COUNT = 3;
-const BALISE_MIN_SEPARATION_M = 80;
 const BALISE_TTL_MS = 2 * 60 * 1000;
-const BALISE_PLAYER_CLEAR_M = 40;
-const WALK_MPS = 2;
+const BALISE_PLAYER_CLEAR_M = 15;
+const BALISE_NEAR_OFFSET_M = 60;
+const BALISE_MIX_NEAR = 0.12;
+const BALISE_MIX_FAR = 0.18;
+const BALISE_FAR_MIN_FRAC = 0.82;
+const BALISE_FAR_MAX_FRAC = 0.97;
+const BALISE_MIN_SEPARATION_BASE_M = 180;
+const BALISE_MIN_SEPARATION_RADIUS_FRAC = 0.28;
+const BALISE_MIN_SEPARATION_FLOOR_M = 120;
 const SIMPLE_FREE_POWER_KINDS = new Set([
   "invisibility",
   "noise",
@@ -69,16 +75,6 @@ function gpsPlayers(room) {
   );
 }
 
-function meanLatLng(pts) {
-  let lat = 0;
-  let lng = 0;
-  for (const p of pts) {
-    lat += p.lat;
-    lng += p.lng;
-  }
-  return { lat: lat / pts.length, lng: lng / pts.length };
-}
-
 function bearingDeg(from, to) {
   const φ1 = (from.lat * Math.PI) / 180;
   const φ2 = (to.lat * Math.PI) / 180;
@@ -86,45 +82,6 @@ function bearingDeg(from, to) {
   const y = Math.sin(Δλ) * Math.cos(φ2);
   const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
   return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
-}
-
-function geometricMedian(pts) {
-  if (!pts.length) return null;
-  if (pts.length === 1) return { lat: pts[0].lat, lng: pts[0].lng };
-  if (pts.length === 2) {
-    return {
-      lat: (pts[0].lat + pts[1].lat) / 2,
-      lng: (pts[0].lng + pts[1].lng) / 2,
-    };
-  }
-  let x = meanLatLng(pts);
-  for (let i = 0; i < 16; i++) {
-    let wsum = 0;
-    let lat = 0;
-    let lng = 0;
-    for (const p of pts) {
-      const d = haversineMeters(x.lat, x.lng, p.lat, p.lng);
-      const w = 1 / Math.max(d, 1.5);
-      lat += p.lat * w;
-      lng += p.lng * w;
-      wsum += w;
-    }
-    if (wsum <= 0) break;
-    const n = { lat: lat / wsum, lng: lng / wsum };
-    if (haversineMeters(x.lat, x.lng, n.lat, n.lng) < 0.4) return n;
-    x = n;
-  }
-  return x;
-}
-
-function remainingPlayMs(room, now) {
-  const hunt = room.huntStartedAt || now;
-  const mins = gameMinutesForPowers(room);
-  return Math.max(0, hunt + mins * 60 * 1000 - now);
-}
-
-function walkBudgetM(room, now) {
-  return Math.max(50, (remainingPlayMs(room, now) / 1000) * WALK_MPS * 0.45);
 }
 
 function clampInsideCircle(pt, center, radiusM, marginM) {
@@ -135,13 +92,72 @@ function clampInsideCircle(pt, center, radiusM, marginM) {
   return offsetMeters(center.lat, center.lng, bearingDeg(center, pt), maxD);
 }
 
-function distanceVariance(pt, players) {
-  if (!players.length) return 0;
-  const ds = players.map((p) => haversineMeters(pt.lat, pt.lng, p.lat, p.lng));
-  const mean = ds.reduce((a, b) => a + b, 0) / ds.length;
-  return ds.reduce((a, d) => a + (d - mean) ** 2, 0) / ds.length;
+function sampleBaliseMixKind() {
+  const r = Math.random();
+  if (r < BALISE_MIX_NEAR) return "near";
+  if (r < BALISE_MIX_NEAR + BALISE_MIX_FAR) return "far";
+  return "uniform";
 }
 
+function baliseMinSeparationM(effectiveRadius) {
+  return Math.max(
+    BALISE_MIN_SEPARATION_BASE_M,
+    Math.round(Number(effectiveRadius) * BALISE_MIN_SEPARATION_RADIUS_FRAC)
+  );
+}
+
+function usableBaliseRadiusM(effectiveRadius, baliseRadiusM) {
+  return Math.max(1, Number(effectiveRadius) - Number(baliseRadiusM || 0));
+}
+
+function separationSteps(desiredSep) {
+  const desired = Math.max(
+    BALISE_MIN_SEPARATION_FLOOR_M,
+    Number(desiredSep) || BALISE_MIN_SEPARATION_BASE_M
+  );
+  const mid = Math.max(BALISE_MIN_SEPARATION_FLOOR_M, Math.round(desired * 0.7));
+  const steps = [desired];
+  if (mid < desired) steps.push(mid);
+  if (BALISE_MIN_SEPARATION_FLOOR_M < mid) steps.push(BALISE_MIN_SEPARATION_FLOOR_M);
+  return steps;
+}
+
+function samplePointInPlayCircle(mixKind, effectiveCenter, effectiveRadius, baliseRadiusM, extra = {}) {
+  const usableR = usableBaliseRadiusM(effectiveRadius, baliseRadiusM);
+  let kind = mixKind;
+  if (kind === "near") {
+    const anchor = extra.nearAnchor;
+    if (anchor && Number.isFinite(anchor.lat) && Number.isFinite(anchor.lng)) {
+      const dist = Math.random() * BALISE_NEAR_OFFSET_M;
+      const bearing = Math.random() * 360;
+      const pt = offsetMeters(anchor.lat, anchor.lng, bearing, dist);
+      return clampInsideCircle(pt, effectiveCenter, effectiveRadius, baliseRadiusM);
+    }
+    kind = "uniform";
+  }
+  if (kind === "far") {
+    const dist = usableR * (BALISE_FAR_MIN_FRAC + Math.random() * (BALISE_FAR_MAX_FRAC - BALISE_FAR_MIN_FRAC));
+    const bearing = Math.random() * 360;
+    return offsetMeters(effectiveCenter.lat, effectiveCenter.lng, bearing, dist);
+  }
+  const dist = Math.sqrt(Math.random()) * usableR;
+  const bearing = Math.random() * 360;
+  return offsetMeters(effectiveCenter.lat, effectiveCenter.lng, bearing, dist);
+}
+
+function candidateMatchesMix(candidate, mixKind, extra, effectiveCenter, usableR) {
+  if (!candidate) return false;
+  if (mixKind === "near") {
+    const a = extra.nearAnchor;
+    if (!a) return true;
+    return haversineMeters(candidate.lat, candidate.lng, a.lat, a.lng) <= BALISE_NEAR_OFFSET_M;
+  }
+  if (mixKind === "far") {
+    const d = haversineMeters(candidate.lat, candidate.lng, effectiveCenter.lat, effectiveCenter.lng);
+    return d >= usableR * BALISE_FAR_MIN_FRAC && d <= usableR * BALISE_FAR_MAX_FRAC;
+  }
+  return true;
+}
 
 function isValidCoordinates(lat, lng) {
   // Enhanced validation with additional checks
@@ -597,22 +613,18 @@ function pickPointOnWayGeometry(geometry) {
 function isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM, extra = {}) {
   if (!isInsideGameZone(candidate.lat, candidate.lng, room)) return false;
   if (haversineMeters(candidate.lat, candidate.lng, effectiveCenter.lat, effectiveCenter.lng) > effectiveRadius - baliseRadiusM) return false;
-  for (const area of blockedAreas) {
+  const blocked = extra.blockedAreas || blockedAreas || [];
+  for (const area of blocked) {
     if (pointInOsmPolygon(candidate.lat, candidate.lng, area.geometry)) return false;
   }
-  const clearM = extra.playerClearM ?? Math.max(BALISE_PLAYER_CLEAR_M, baliseRadiusM);
-  if ([...room.players.values()].some((p) => {
+  const clearM = extra.playerClearM ?? BALISE_PLAYER_CLEAR_M;
+  if (clearM > 0 && [...room.players.values()].some((p) => {
     if (p.lat == null || p.lng == null) return false;
     return haversineMeters(p.lat, p.lng, candidate.lat, candidate.lng) < clearM;
   })) return false;
   const existing = extra.existing || [];
-  const sep = extra.minSeparationM ?? BALISE_MIN_SEPARATION_M;
+  const sep = extra.minSeparationM ?? BALISE_MIN_SEPARATION_BASE_M;
   if (existing.some((b) => haversineMeters(b.lat, b.lng, candidate.lat, candidate.lng) < sep)) return false;
-  if (extra.centroid && extra.maxFromCentroid != null) {
-    if (haversineMeters(candidate.lat, candidate.lng, extra.centroid.lat, extra.centroid.lng) > extra.maxFromCentroid) {
-      return false;
-    }
-  }
   return true;
 }
 
@@ -708,12 +720,17 @@ out center geom;`;
 async function pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra = {}) {
   try {
     const { walkways, crossingNodes, blockedAreas } = await fetchOsmBaliseCandidates(effectiveCenter, effectiveRadius);
+    extra.blockedAreas = blockedAreas;
+    const mixKind = extra.mixKind || "uniform";
+    const usableR = usableBaliseRadiusM(effectiveRadius, baliseRadiusM);
     const pool = [];
     const wayPool = [...walkways].sort(() => Math.random() - 0.5);
     for (const way of wayPool) {
       for (let i = 0; i < 8; i++) {
         const candidate = pickPointOnWayGeometry(way.geometry);
-        if (candidate && isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM, extra)) {
+        if (!candidate) continue;
+        if (!candidateMatchesMix(candidate, mixKind, extra, effectiveCenter, usableR)) continue;
+        if (isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM, extra)) {
           pool.push({ ...candidate, source: "osm", osmWayId: way.id });
         }
       }
@@ -721,24 +738,13 @@ async function pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, bal
     const nodePool = [...crossingNodes].sort(() => Math.random() - 0.5);
     for (const node of nodePool) {
       const candidate = { lat: Number(node.lat), lng: Number(node.lon) };
+      if (!candidateMatchesMix(candidate, mixKind, extra, effectiveCenter, usableR)) continue;
       if (isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM, extra)) {
         pool.push({ ...candidate, source: "osm", osmNodeId: node.id });
       }
     }
     if (!pool.length) return null;
-    const target = extra.target;
-    const players = extra.players || [];
-    pool.sort((a, b) => {
-      const va = distanceVariance(a, players);
-      const vb = distanceVariance(b, players);
-      if (target) {
-        const da = haversineMeters(a.lat, a.lng, target.lat, target.lng);
-        const db = haversineMeters(b.lat, b.lng, target.lat, target.lng);
-        return da + va * 0.02 - (db + vb * 0.02);
-      }
-      return va - vb;
-    });
-    return pool[0];
+    return pool[Math.floor(Math.random() * pool.length)];
   } catch (e) {
     console.warn("Placement OSM balise indisponible:", e?.message || e);
   }
@@ -746,41 +752,18 @@ async function pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, bal
 }
 
 function pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra = {}) {
-  const players = extra.players || gpsPlayers(room);
-  const target = extra.target || effectiveCenter;
-  const jitterMax = extra.jitterMaxM ?? 55;
-  let best = null;
-  let bestScore = Infinity;
-  for (let i = 0; i < 36; i++) {
-    const candidate = randomOffsetPoint(target.lat, target.lng, jitterMax, 0.15, 1);
+  const mixKind = extra.mixKind || "uniform";
+  const blocked = extra.blockedAreas || [];
+  const usableR = usableBaliseRadiusM(effectiveRadius, baliseRadiusM);
+  const tries = extra.sampleTries || 120;
+  for (let i = 0; i < tries; i++) {
+    const candidate = samplePointInPlayCircle(mixKind, effectiveCenter, effectiveRadius, baliseRadiusM, extra);
     const clamped = clampInsideCircle(candidate, effectiveCenter, effectiveRadius, baliseRadiusM);
-    if (!isOsmCandidateSafe(clamped, [], room, effectiveCenter, effectiveRadius, baliseRadiusM, extra)) continue;
-    const score = distanceVariance(clamped, players) + haversineMeters(clamped.lat, clamped.lng, target.lat, target.lng);
-    if (score < bestScore) {
-      bestScore = score;
-      best = clamped;
-    }
+    if (mixKind !== "near" && !candidateMatchesMix(clamped, mixKind, extra, effectiveCenter, usableR)) continue;
+    if (!isOsmCandidateSafe(clamped, blocked, room, effectiveCenter, effectiveRadius, baliseRadiusM, extra)) continue;
+    return { ...clamped, source: "fallback_mix" };
   }
-  return best || clampInsideCircle(target, effectiveCenter, effectiveRadius, baliseRadiusM);
-}
-
-function fairBaliseTarget(room, effectiveCenter, effectiveRadius, baliseRadiusM, now) {
-  const players = gpsPlayers(room);
-  let median;
-  if (players.length >= 2) median = geometricMedian(players);
-  else if (players.length === 1) {
-    median = offsetMeters(players[0].lat, players[0].lng, Math.random() * 360, 55);
-  } else {
-    median = { lat: effectiveCenter.lat, lng: effectiveCenter.lng };
-  }
-  const centroid = players.length ? meanLatLng(players) : effectiveCenter;
-  median = clampInsideCircle(median, effectiveCenter, effectiveRadius, baliseRadiusM + 8);
-  const jitter = randomOffsetPoint(median.lat, median.lng, 40, 0.2, 1);
-  const target = clampInsideCircle(jitter, effectiveCenter, effectiveRadius, baliseRadiusM + 8);
-  const centroidFromZone = haversineMeters(centroid.lat, centroid.lng, effectiveCenter.lat, effectiveCenter.lng);
-  const rimFromCentroid = Math.max(40, effectiveRadius - centroidFromZone);
-  const maxFromCentroid = Math.min(walkBudgetM(room, now), rimFromCentroid * 0.7, Math.max(80, effectiveRadius * 0.5));
-  return { target, centroid, players, maxFromCentroid };
+  return null;
 }
 
 async function spawnBalise(room, spawnAt = null) {
@@ -795,15 +778,18 @@ async function spawnBalise(room, spawnAt = null) {
   const live = room.balises.filter((b) => !b.expiresAt || now < b.expiresAt);
   if (live.length >= BALISE_TARGET_COUNT) return null;
 
-  const fair = fairBaliseTarget(room, effectiveCenter, effectiveRadius, baliseRadiusM, now);
-  const extra = {
+  const players = gpsPlayers(room);
+  let mixKind = sampleBaliseMixKind();
+  const nearAnchor = mixKind === "near" && players.length
+    ? players[Math.floor(Math.random() * players.length)]
+    : null;
+  if (mixKind === "near" && !nearAnchor) mixKind = "uniform";
+  const extraBase = {
     existing: live,
-    players: fair.players,
-    target: fair.target,
-    centroid: fair.centroid,
-    maxFromCentroid: fair.maxFromCentroid,
-    playerClearM: Math.max(BALISE_PLAYER_CLEAR_M, baliseRadiusM),
-    minSeparationM: BALISE_MIN_SEPARATION_M,
+    players,
+    mixKind,
+    nearAnchor,
+    playerClearM: mixKind === "near" ? 0 : BALISE_PLAYER_CLEAR_M,
   };
 
   let position = null;
@@ -818,8 +804,12 @@ async function spawnBalise(room, spawnAt = null) {
     };
     room.nextBaliseOverride = null;
   } else {
-    position = await pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra) ||
-      pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra);
+    for (const sep of separationSteps(baliseMinSeparationM(effectiveRadius))) {
+      const extra = { ...extraBase, minSeparationM: sep };
+      position = await pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra) ||
+        pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra);
+      if (position) break;
+    }
   }
 
   if (!position || !Number.isFinite(position.lat) || !Number.isFinite(position.lng)) return null;
@@ -830,7 +820,7 @@ async function spawnBalise(room, spawnAt = null) {
     lng: position.lng,
     radiusM: baliseRadiusM,
     visualScale: 1,
-    placementHint: position.source === "osm" ? "osm_pedestrian_way" : position.source || "fallback_fair",
+    placementHint: position.source === "osm" ? "osm_pedestrian_way" : position.source || "fallback_mix",
     osmWayId: position.osmWayId || null,
     createdAt: now,
     expiresAt: now + BALISE_TTL_MS,
