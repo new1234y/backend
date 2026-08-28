@@ -315,10 +315,7 @@ io.on("connection", (socket) => {
       // Nettoyer l'ancien socket s'il existe encore
       const oldSocketId = foundPlayer.socketId;
       if (oldSocketId && oldSocketId !== socket.id) {
-        const oldSocket = io.sockets.sockets.get(oldSocketId);
-        if (oldSocket) {
-          oldSocket.leave(room.code);
-        }
+        store.notifySessionReplaced(io, room, oldSocketId);
         store.socketToRoom.delete(oldSocketId);
       }
 
@@ -340,9 +337,10 @@ io.on("connection", (socket) => {
         nickname: foundPlayer.nickname,
       });
 
-      const isHost = room.hostId === oldSocketId;
+      const isHost = room.hostId === oldSocketId || room.hostId === oldKey;
       if (isHost) {
         room.hostId = socket.id;
+        store.onHostRebound(io, room);
       }
 
       // Restore admin role if player was admin
@@ -449,7 +447,7 @@ io.on("connection", (socket) => {
     // Sanitize nickname to prevent XSS
     const sanitizedNickname = nickname.trim().replace(/[<>]/g, '');
     
-    const result = store.joinRoom(socket.id, code, sanitizedNickname, existingSessionId);
+    const result = store.joinRoom(socket.id, code, sanitizedNickname, existingSessionId, io);
     if (result.error) {
       cb?.({
         ok: false,
@@ -651,7 +649,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("request_join_midgame", ({ code, nickname }, cb) => {
-    const r = store.requestJoinMidgame(socket.id, code, nickname, io);
+    const r = store.requestJoinMidgame(socket.id, String(code || "").toUpperCase(), nickname, io);
     if (r.error) {
       cb?.({ ok: false, error: r.error, useNormalJoin: Boolean(r.useNormalJoin) });
       return;
@@ -828,6 +826,9 @@ io.on("connection", (socket) => {
 
     const player = room.players.get(socket.id);
     if (player) {
+      if (room.hostId === socket.id) {
+        store.onHostDisconnected(io, room);
+      }
       player.disconnectedAt = Date.now();
       io.to(code).emit("player_disconnected", {
         nickname: player.nickname,

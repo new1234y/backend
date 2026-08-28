@@ -1144,6 +1144,79 @@ export function createRoomsStore({
     }
   }
 
+  function resolveHostSocketId(room) {
+    if (room.hostId && room.players.has(room.hostId)) return room.hostId;
+    for (const p of room.players.values()) {
+      if (p.socketId === room.hostId) return p.socketId;
+    }
+    return room.hostId || null;
+  }
+
+  function nicknameTaken(room, nickname, exceptSocketId = null) {
+    const normalized = String(nickname || "Joueur").slice(0, 24).toLowerCase();
+    for (const player of room.players.values()) {
+      if (exceptSocketId && (player.socketId === exceptSocketId)) continue;
+      if (String(player.nickname || "").toLowerCase() === normalized) return true;
+    }
+    return false;
+  }
+
+  function notifySessionReplaced(io, room, oldSocketId) {
+    if (!io || !oldSocketId) return;
+    const oldSocket = io.sockets.sockets.get(oldSocketId);
+    if (!oldSocket) return;
+    oldSocket.emit("session_replaced", {
+      reason: "replaced",
+      message: "Cette session continue sur une autre page. Celle-ci est terminée.",
+    });
+    oldSocket.leave(room.code);
+  }
+
+  function emitJoinRequestToHost(io, room, pending) {
+    if (!io || !pending) return;
+    const hostSocketId = resolveHostSocketId(room);
+    if (!hostSocketId) return;
+    const hostSock = io.sockets.sockets.get(hostSocketId);
+    hostSock?.emit("join_request_pending", {
+      requestId: pending.id,
+      nickname: pending.nickname,
+      code: room.code,
+      hostSessionId: room.players.get(hostSocketId)?.sessionId ?? null,
+    });
+  }
+
+  function emitPendingJoinsToHost(io, room) {
+    if (!room.pendingJoins?.length) return;
+    for (const pending of room.pendingJoins) {
+      emitJoinRequestToHost(io, room, pending);
+    }
+  }
+
+  function notifyPendingJoiners(io, room, event, extra = {}) {
+    if (!io || !room.pendingJoins?.length) return;
+    for (const pending of room.pendingJoins) {
+      const sock = io.sockets.sockets.get(pending.socketId);
+      sock?.emit(event, {
+        code: room.code,
+        requestId: pending.id,
+        ...extra,
+      });
+    }
+  }
+
+  function onHostRebound(io, room) {
+    emitPendingJoinsToHost(io, room);
+    notifyPendingJoiners(io, room, "join_request_host_reconnected", {
+      message: "L'hôte est de retour. En attente de sa décision.",
+    });
+  }
+
+  function onHostDisconnected(io, room) {
+    notifyPendingJoiners(io, room, "join_request_host_disconnected", {
+      message: "L'hôte s'est déconnecté. En attente de sa reconnexion…",
+    });
+  }
+
   function isSocketConnected(io, socketId) {
     const s = io.sockets.sockets.get(socketId);
     return Boolean(s?.connected);
@@ -1315,7 +1388,7 @@ export function createRoomsStore({
     return { room, player };
   }
 
-  function joinRoom(socketId, code, nickname, existingSessionId = null) {
+  function joinRoom(socketId, code, nickname, existingSessionId = null, io = null) {
     leaveRoom(socketId);
     const room = rooms.get(String(code || "").toUpperCase());
     if (!room) {
@@ -1337,16 +1410,18 @@ export function createRoomsStore({
         }
         if (foundPlayer) {
           const oldSocketId = foundPlayer.socketId;
-          foundPlayer.socketId = socketId;
-          foundPlayer.disconnectedAt = null;
           if (oldSocketId && oldSocketId !== socketId) {
+            notifySessionReplaced(io, room, oldSocketId);
             room.players.delete(oldSocketId);
             socketToRoom.delete(oldSocketId);
           }
+          foundPlayer.socketId = socketId;
+          foundPlayer.disconnectedAt = null;
           room.players.set(socketId, foundPlayer);
           socketToRoom.set(socketId, room.code);
           if (room.hostId === oldSocketId) {
             room.hostId = socketId;
+            onHostRebound(io, room);
           }
           console.log(`Reconnexion dans ${room.code} · ${foundPlayer.nickname}`);
           
@@ -1388,6 +1463,10 @@ export function createRoomsStore({
           
           return { room, player: foundPlayer, isRejoin: true };
         }
+      }
+
+      if (nicknameTaken(room, nickname)) {
+        return { error: "Ce pseudo est déjà utilisé dans cette partie." };
       }
 
       return {
@@ -2764,8 +2843,12 @@ export function createRoomsStore({
   }
 
   function requestJoinMidgame(socketId, code, nickname, io) {
-    leaveRoom(socketId);
-    const room = rooms.get(String(code || "").toUpperCase());
+    const targetCode = String(code || "").toUpperCase();
+    const existingCode = socketToRoom.get(socketId);
+    if (existingCode && existingCode !== targetCode) {
+      leaveRoom(socketId);
+    }
+    const room = rooms.get(targetCode);
     if (!room) return { error: "Salle introuvable." };
     if (room.phase === "lobby") {
       return { error: "LOBBY", useNormalJoin: true };
@@ -2778,20 +2861,20 @@ export function createRoomsStore({
         return { error: "Vous êtes déjà dans cette salle." };
       }
     }
+    const nick = String(nickname || "Joueur").slice(0, 24);
+    if (nicknameTaken(room, nick)) {
+      return { error: "Ce pseudo est déjà utilisé dans cette partie." };
+    }
     if (!room.pendingJoins) room.pendingJoins = [];
+    room.pendingJoins = room.pendingJoins.filter((x) => x.socketId !== socketId);
     const pending = {
       id: uuidv4(),
       socketId: socketId,
-      nickname: String(nickname || "Joueur").slice(0, 24),
+      nickname: nick,
       requestedAt: Date.now(),
     };
     room.pendingJoins.push(pending);
-    io.to(room.code).emit("join_request_pending", {
-      requestId: pending.id,
-      nickname: pending.nickname,
-      code: room.code,
-      hostSessionId: room.players.get(room.hostId)?.sessionId ?? null,
-    });
+    emitJoinRequestToHost(io, room, pending);
     return { ok: true, requestId: pending.id };
   }
 
@@ -2799,8 +2882,10 @@ export function createRoomsStore({
     const code = socketToRoom.get(responderSocketId);
     if (!code) return { error: "Pas dans une salle." };
     const room = rooms.get(code);
-    if (!room || !room.players.has(responderSocketId)) {
-      return { error: "Réservé aux membres de la partie." };
+    if (!room) return { error: "Salle introuvable." };
+    const hostSocketId = resolveHostSocketId(room);
+    if (hostSocketId !== responderSocketId) {
+      return { error: "Seul l'hôte peut accepter ou refuser." };
     }
     if (!room.pendingJoins?.length) return { error: "Aucune demande." };
     const idx = room.pendingJoins.findIndex((x) => x.id === requestId);
@@ -2816,7 +2901,14 @@ export function createRoomsStore({
       return { ok: true };
     }
     if (!reqSock?.connected) {
-      return { error: "Le joueur n'est plus connecté." };
+      return { error: "Le joueur n'est plus connecté. La demande a été annulée." };
+    }
+    if (nicknameTaken(room, pending.nickname)) {
+      reqSock.emit("join_request_denied", {
+        code: room.code,
+        message: "Ce pseudo est déjà utilisé dans cette partie.",
+      });
+      return { error: "Ce pseudo est déjà utilisé dans cette partie." };
     }
     const sessionId = uuidv4();
     const player = {
@@ -3523,6 +3615,11 @@ export function createRoomsStore({
     appendLocationSample,
     requestJoinMidgame,
     respondJoinRequest,
+    notifySessionReplaced,
+    onHostRebound,
+    onHostDisconnected,
+    emitPendingJoinsToHost,
+    resolveHostSocketId,
     clearRoomAbandonTimer,
     scheduleNukeIfAllAway,
     purgeStaleDisconnects,
