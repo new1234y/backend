@@ -19,6 +19,130 @@ const OVERPASS_URLS = [
 const OSM_BALISE_CACHE_TTL_MS = 10 * 60 * 1000;
 const osmBaliseCache = new Map();
 
+const BALISE_RADIUS_M = 30;
+const BALISE_TARGET_COUNT = 3;
+const BALISE_MIN_SEPARATION_M = 80;
+const BALISE_TTL_MS = 2 * 60 * 1000;
+const BALISE_PLAYER_CLEAR_M = 40;
+const WALK_MPS = 2;
+const SIMPLE_FREE_POWER_KINDS = new Set([
+  "invisibility",
+  "noise",
+  "freeze_cats",
+  "fake_position",
+  "balise_leurre",
+]);
+
+function clampNum(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function gameMinutesForPowers(room) {
+  const s = room?.settings || {};
+  if (!s.timeLimitEnabled) return 30;
+  const mins = Number(s.timeLimitMinutes);
+  return Number.isFinite(mins) && mins >= 1 ? mins : 30;
+}
+
+function maxPowerSecForRoom(room) {
+  return clampNum(Math.round(gameMinutesForPowers(room) * 4), 45, 120);
+}
+
+function clampPowerDuration(sec, room, min = 5, fallback = 60) {
+  const max = maxPowerSecForRoom(room);
+  const raw = Number(sec);
+  const chosen = Number.isFinite(raw) && raw > 0 ? raw : Math.min(fallback, max);
+  return Math.max(min, Math.min(max, Math.round(chosen)));
+}
+
+function durationFactor60(durationSec) {
+  return Math.pow(Math.max(1, Number(durationSec) || 60) / 60, 1.6);
+}
+
+function gpsPlayers(room) {
+  return [...(room.players?.values?.() || [])].filter(
+    (p) =>
+      p &&
+      !p.spectator &&
+      Number.isFinite(p.lat) &&
+      Number.isFinite(p.lng)
+  );
+}
+
+function meanLatLng(pts) {
+  let lat = 0;
+  let lng = 0;
+  for (const p of pts) {
+    lat += p.lat;
+    lng += p.lng;
+  }
+  return { lat: lat / pts.length, lng: lng / pts.length };
+}
+
+function bearingDeg(from, to) {
+  const φ1 = (from.lat * Math.PI) / 180;
+  const φ2 = (to.lat * Math.PI) / 180;
+  const Δλ = ((to.lng - from.lng) * Math.PI) / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+function geometricMedian(pts) {
+  if (!pts.length) return null;
+  if (pts.length === 1) return { lat: pts[0].lat, lng: pts[0].lng };
+  if (pts.length === 2) {
+    return {
+      lat: (pts[0].lat + pts[1].lat) / 2,
+      lng: (pts[0].lng + pts[1].lng) / 2,
+    };
+  }
+  let x = meanLatLng(pts);
+  for (let i = 0; i < 16; i++) {
+    let wsum = 0;
+    let lat = 0;
+    let lng = 0;
+    for (const p of pts) {
+      const d = haversineMeters(x.lat, x.lng, p.lat, p.lng);
+      const w = 1 / Math.max(d, 1.5);
+      lat += p.lat * w;
+      lng += p.lng * w;
+      wsum += w;
+    }
+    if (wsum <= 0) break;
+    const n = { lat: lat / wsum, lng: lng / wsum };
+    if (haversineMeters(x.lat, x.lng, n.lat, n.lng) < 0.4) return n;
+    x = n;
+  }
+  return x;
+}
+
+function remainingPlayMs(room, now) {
+  const hunt = room.huntStartedAt || now;
+  const mins = gameMinutesForPowers(room);
+  return Math.max(0, hunt + mins * 60 * 1000 - now);
+}
+
+function walkBudgetM(room, now) {
+  return Math.max(50, (remainingPlayMs(room, now) / 1000) * WALK_MPS * 0.45);
+}
+
+function clampInsideCircle(pt, center, radiusM, marginM) {
+  if (!center || !pt) return pt;
+  const maxD = Math.max(1, Number(radiusM) - Number(marginM || 0));
+  const d = haversineMeters(pt.lat, pt.lng, center.lat, center.lng);
+  if (d <= maxD) return pt;
+  return offsetMeters(center.lat, center.lng, bearingDeg(center, pt), maxD);
+}
+
+function distanceVariance(pt, players) {
+  if (!players.length) return 0;
+  const ds = players.map((p) => haversineMeters(pt.lat, pt.lng, p.lat, p.lng));
+  const mean = ds.reduce((a, b) => a + b, 0) / ds.length;
+  return ds.reduce((a, d) => a + (d - mean) ** 2, 0) / ds.length;
+}
+
+
 function isValidCoordinates(lat, lng) {
   // Enhanced validation with additional checks
   if (lat == null || lng == null) return false;
@@ -470,16 +594,26 @@ function pickPointOnWayGeometry(geometry) {
   return { lat, lng };
 }
 
-function isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM) {
+function isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM, extra = {}) {
   if (!isInsideGameZone(candidate.lat, candidate.lng, room)) return false;
   if (haversineMeters(candidate.lat, candidate.lng, effectiveCenter.lat, effectiveCenter.lng) > effectiveRadius - baliseRadiusM) return false;
   for (const area of blockedAreas) {
     if (pointInOsmPolygon(candidate.lat, candidate.lng, area.geometry)) return false;
   }
-  return ![...room.players.values()].some((p) => {
+  const clearM = extra.playerClearM ?? Math.max(BALISE_PLAYER_CLEAR_M, baliseRadiusM);
+  if ([...room.players.values()].some((p) => {
     if (p.lat == null || p.lng == null) return false;
-    return haversineMeters(p.lat, p.lng, candidate.lat, candidate.lng) < Math.max(35, baliseRadiusM);
-  });
+    return haversineMeters(p.lat, p.lng, candidate.lat, candidate.lng) < clearM;
+  })) return false;
+  const existing = extra.existing || [];
+  const sep = extra.minSeparationM ?? BALISE_MIN_SEPARATION_M;
+  if (existing.some((b) => haversineMeters(b.lat, b.lng, candidate.lat, candidate.lng) < sep)) return false;
+  if (extra.centroid && extra.maxFromCentroid != null) {
+    if (haversineMeters(candidate.lat, candidate.lng, extra.centroid.lat, extra.centroid.lng) > extra.maxFromCentroid) {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function fetchOsmBaliseCandidates(center, radiusM, maxRetries = 2) {
@@ -571,73 +705,108 @@ out center geom;`;
   return { walkways: [], crossingNodes: [], blockedAreas: [] };
 }
 
-async function pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM) {
+async function pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra = {}) {
   try {
     const { walkways, crossingNodes, blockedAreas } = await fetchOsmBaliseCandidates(effectiveCenter, effectiveRadius);
-
-    // Build a mixed pool of candidates: points from ways (random geometry nodes) and crossing nodes directly
+    const pool = [];
     const wayPool = [...walkways].sort(() => Math.random() - 0.5);
     for (const way of wayPool) {
       for (let i = 0; i < 8; i++) {
         const candidate = pickPointOnWayGeometry(way.geometry);
-        if (candidate && isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM)) {
-          return { ...candidate, source: "osm", osmWayId: way.id };
+        if (candidate && isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM, extra)) {
+          pool.push({ ...candidate, source: "osm", osmWayId: way.id });
         }
       }
     }
-
     const nodePool = [...crossingNodes].sort(() => Math.random() - 0.5);
     for (const node of nodePool) {
       const candidate = { lat: Number(node.lat), lng: Number(node.lon) };
-      if (isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM)) {
-        return { ...candidate, source: "osm", osmNodeId: node.id };
+      if (isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effectiveRadius, baliseRadiusM, extra)) {
+        pool.push({ ...candidate, source: "osm", osmNodeId: node.id });
       }
     }
+    if (!pool.length) return null;
+    const target = extra.target;
+    const players = extra.players || [];
+    pool.sort((a, b) => {
+      const va = distanceVariance(a, players);
+      const vb = distanceVariance(b, players);
+      if (target) {
+        const da = haversineMeters(a.lat, a.lng, target.lat, target.lng);
+        const db = haversineMeters(b.lat, b.lng, target.lat, target.lng);
+        return da + va * 0.02 - (db + vb * 0.02);
+      }
+      return va - vb;
+    });
+    return pool[0];
   } catch (e) {
     console.warn("Placement OSM balise indisponible:", e?.message || e);
   }
   return null;
 }
 
-function pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM) {
-  let position = null;
-  for (let i = 0; i < 20; i++) {
-    const candidate = randomOffsetPoint(
-      effectiveCenter.lat,
-      effectiveCenter.lng,
-      Math.max(1, effectiveRadius - baliseRadiusM),
-      0.15,
-      0.9
-    );
-    const tooCloseToPlayer = [...room.players.values()].some((p) => {
-      if (p.lat == null || p.lng == null) return false;
-      return haversineMeters(p.lat, p.lng, candidate.lat, candidate.lng) < Math.max(35, baliseRadiusM);
-    });
-    if (!tooCloseToPlayer) {
-      position = candidate;
-      break;
+function pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra = {}) {
+  const players = extra.players || gpsPlayers(room);
+  const target = extra.target || effectiveCenter;
+  const jitterMax = extra.jitterMaxM ?? 55;
+  let best = null;
+  let bestScore = Infinity;
+  for (let i = 0; i < 36; i++) {
+    const candidate = randomOffsetPoint(target.lat, target.lng, jitterMax, 0.15, 1);
+    const clamped = clampInsideCircle(candidate, effectiveCenter, effectiveRadius, baliseRadiusM);
+    if (!isOsmCandidateSafe(clamped, [], room, effectiveCenter, effectiveRadius, baliseRadiusM, extra)) continue;
+    const score = distanceVariance(clamped, players) + haversineMeters(clamped.lat, clamped.lng, target.lat, target.lng);
+    if (score < bestScore) {
+      bestScore = score;
+      best = clamped;
     }
   }
-  return position || randomOffsetPoint(
-    effectiveCenter.lat,
-    effectiveCenter.lng,
-    Math.max(1, effectiveRadius - baliseRadiusM),
-    0.15,
-    0.9
-  );
+  return best || clampInsideCircle(target, effectiveCenter, effectiveRadius, baliseRadiusM);
+}
+
+function fairBaliseTarget(room, effectiveCenter, effectiveRadius, baliseRadiusM, now) {
+  const players = gpsPlayers(room);
+  let median;
+  if (players.length >= 2) median = geometricMedian(players);
+  else if (players.length === 1) {
+    median = offsetMeters(players[0].lat, players[0].lng, Math.random() * 360, 55);
+  } else {
+    median = { lat: effectiveCenter.lat, lng: effectiveCenter.lng };
+  }
+  const centroid = players.length ? meanLatLng(players) : effectiveCenter;
+  median = clampInsideCircle(median, effectiveCenter, effectiveRadius, baliseRadiusM + 8);
+  const jitter = randomOffsetPoint(median.lat, median.lng, 40, 0.2, 1);
+  const target = clampInsideCircle(jitter, effectiveCenter, effectiveRadius, baliseRadiusM + 8);
+  const centroidFromZone = haversineMeters(centroid.lat, centroid.lng, effectiveCenter.lat, effectiveCenter.lng);
+  const rimFromCentroid = Math.max(40, effectiveRadius - centroidFromZone);
+  const maxFromCentroid = Math.min(walkBudgetM(room, now), rimFromCentroid * 0.7, Math.max(80, effectiveRadius * 0.5));
+  return { target, centroid, players, maxFromCentroid };
 }
 
 async function spawnBalise(room, spawnAt = null) {
   if (!room.gameCenter) return;
   const t = Number.isFinite(spawnAt) ? spawnAt : Date.now();
+  const now = Date.now();
   const shrink = spawnAt ? getShrinkStateAtTimestamp(room, t) : getShrinkState(room);
   const effectiveCenter = shrink.currentCenter || room.gameCenter;
   const effectiveRadius = shrink.currentRadius || getEffectiveGlobalRadius(room);
-  const radiusFactor = 0.04 + Math.random() * 0.04;
-  const baliseRadiusM = Math.max(18, Math.min(55, Math.round(effectiveRadius * radiusFactor)));
+  const baliseRadiusM = BALISE_RADIUS_M;
+  if (!Array.isArray(room.balises)) room.balises = [];
+  const live = room.balises.filter((b) => !b.expiresAt || now < b.expiresAt);
+  if (live.length >= BALISE_TARGET_COUNT) return null;
+
+  const fair = fairBaliseTarget(room, effectiveCenter, effectiveRadius, baliseRadiusM, now);
+  const extra = {
+    existing: live,
+    players: fair.players,
+    target: fair.target,
+    centroid: fair.centroid,
+    maxFromCentroid: fair.maxFromCentroid,
+    playerClearM: Math.max(BALISE_PLAYER_CLEAR_M, baliseRadiusM),
+    minSeparationM: BALISE_MIN_SEPARATION_M,
+  };
 
   let position = null;
-  // Si un chat a programmé une balise-leurre, on l'utilise pour la prochaine balise uniquement
   if (room.nextBaliseOverride &&
       Number.isFinite(room.nextBaliseOverride.lat) &&
       Number.isFinite(room.nextBaliseOverride.lng)) {
@@ -649,23 +818,22 @@ async function spawnBalise(room, spawnAt = null) {
     };
     room.nextBaliseOverride = null;
   } else {
-    position = await pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM) ||
-      pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM);
+    position = await pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra) ||
+      pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra);
   }
-  
-  // Remove all existing balises (only one active at a time)
-  room.balises = [];
-  
+
+  if (!position || !Number.isFinite(position.lat) || !Number.isFinite(position.lng)) return null;
+
   const balise = {
     id: uuidv4(),
     lat: position.lat,
     lng: position.lng,
     radiusM: baliseRadiusM,
-    visualScale: Number((baliseRadiusM / 30).toFixed(2)),
-    placementHint: position.source === "osm" ? "osm_pedestrian_way" : position.source || "fallback_random",
+    visualScale: 1,
+    placementHint: position.source === "osm" ? "osm_pedestrian_way" : position.source || "fallback_fair",
     osmWayId: position.osmWayId || null,
-    createdAt: Date.now(),
-    expiresAt: Date.now() + (2 * 60 * 1000), // 2 minutes
+    createdAt: now,
+    expiresAt: now + BALISE_TTL_MS,
     capturedBy: null,
     captureProgress: 0,
     beingCapturedBy: null,
@@ -678,132 +846,111 @@ async function spawnBalise(room, spawnAt = null) {
   return balise;
 }
 
+function notifyBaliseBlocked(room, io, player, message) {
+  if (!io || !player) return;
+  const now = Date.now();
+  if (!room._baliseBlockedAt) room._baliseBlockedAt = {};
+  const key = String(player.sessionId);
+  if (now - (room._baliseBlockedAt[key] || 0) < 4000) return;
+  room._baliseBlockedAt[key] = now;
+  const payload = {
+    sessionId: player.sessionId,
+    message: message || "Une personne est déjà en train de la capturer",
+  };
+  try {
+    const sock = io.sockets.sockets.get(player.socketId);
+    sock?.emit("balise_capture_blocked", payload);
+    sock?.emit("game_notification", { kind: "balise_blocked", ...payload });
+  } catch (e) {
+    console.warn("Failed to emit balise_capture_blocked:", e?.message || e);
+  }
+}
+
 function updateBalises(room, io) {
   if (room.phase !== "playing") return;
-  
-  const now = Date.now();
-  const baliseSpawnInterval = 2 * 60 * 1000; // 2 minutes
-  
-  // Spawn new balise every 2 minutes OR if no balise exists
-  if (!room.lastBaliseSpawnAt || now - room.lastBaliseSpawnAt >= baliseSpawnInterval || room.balises.length === 0) {
-    if (!room.baliseSpawnPending) {
-      room.baliseSpawnPending = true;
-      room.lastBaliseSpawnAt = now;
-      spawnBalise(room, room.lastBaliseSpawnAt)
-        .catch((e) => {
-          console.warn("Erreur création balise:", e?.message || e);
-        })
-        .finally(() => {
-          room.baliseSpawnPending = false;
-        });
-    }
-  }
-  
-  // Update balise capture progress
-  const captureTime = 20 * 1000; // 20 seconds
-  const toRemove = [];
-  
-  for (const balise of room.balises) {
-    if (balise.capturedBy) {
-      toRemove.push(balise.id);
-      continue;
-    }
 
-    // Remove expired balises
+  const now = Date.now();
+  const captureTime = 20 * 1000;
+  const toRemove = [];
+
+  for (const balise of room.balises) {
     if (balise.expiresAt && now >= balise.expiresAt) {
       toRemove.push(balise.id);
       continue;
     }
-    
-    let currentPlayerInside = null;
-    
+
+    if (balise.capturedBy) continue;
+
+    const inside = [];
     for (const p of room.players.values()) {
       if ((p.role !== "player" && p.role !== "cat") || p.captured || p.spectator) continue;
       if (p.lat == null || p.lng == null) continue;
-      
       const distance = haversineMeters(p.lat, p.lng, balise.lat, balise.lng);
-      if (distance <= balise.radiusM) {
-        currentPlayerInside = p;
-        break;
-      }
+      if (distance <= balise.radiusM) inside.push(p);
     }
-    
-    if (currentPlayerInside) {
-      // Vérifier si la balise est déjà capturée ou en cours de capture par un autre joueur
-      if (balise.beingCapturedBy && balise.beingCapturedBy !== currentPlayerInside.sessionId) {
-        // Envoyer une notification au joueur qui tente de capturer
-        try {
-          if (io && room.code) {
-            io.to(room.code).emit("balise_capture_blocked", {
-              sessionId: currentPlayerInside.sessionId,
-              message: "La balise est déjà en cours de capture, vous ne pouvez pas la capturer."
-            });
-          }
-        } catch (e) {
-          console.warn('Failed to emit balise_capture_blocked socket event:', e?.message || e);
+
+    const capturer = inside.find((p) => p.sessionId === balise.beingCapturedBy);
+
+    if (capturer) {
+      for (const p of inside) {
+        if (p.sessionId !== capturer.sessionId) {
+          notifyBaliseBlocked(room, io, p, "Une personne est déjà en train de la capturer");
         }
-        // Ne pas permettre la capture
-        continue;
       }
-      
-      if (balise.beingCapturedBy === currentPlayerInside.sessionId) {
-        balise.captureProgress += 1000; // Add 1 second (called every second)
-      } else {
-        balise.beingCapturedBy = currentPlayerInside.sessionId;
-        balise.captureProgress = 1000;
-      }
-      
+      balise.captureProgress += 1000;
       if (balise.captureProgress >= captureTime) {
-        balise.capturedBy = currentPlayerInside.sessionId;
-        const award = 20; // Award 20 coins per user request
-        // Award coins to both players and cats
-        currentPlayerInside.coins = (currentPlayerInside.coins || 0) + award;
-        recordCoinTransaction(currentPlayerInside, award, "balise", "Capture de balise");
+        balise.capturedBy = capturer.sessionId;
+        balise.beingCapturedBy = null;
+        const award = 20;
+        capturer.coins = (capturer.coins || 0) + award;
+        recordCoinTransaction(capturer, award, "balise", "Capture de balise");
         pushTimeline(room, {
           type: "balise_captured",
           baliseId: balise.id,
-          sessionId: currentPlayerInside.sessionId,
-          nickname: currentPlayerInside.nickname,
-          role: currentPlayerInside.role,
+          sessionId: capturer.sessionId,
+          nickname: capturer.nickname,
+          role: capturer.role,
           awardedCoins: award,
         });
         try {
-          // Notify clients immediately so UI can show coin feed / capture toast
           if (io && room.code) {
             io.to(room.code).emit("balise_captured", {
               baliseId: balise.id,
-              sessionId: currentPlayerInside.sessionId,
-              nickname: currentPlayerInside.nickname,
-              role: currentPlayerInside.role,
+              sessionId: capturer.sessionId,
+              nickname: capturer.nickname,
+              role: capturer.role,
               awardedCoins: award,
             });
           }
         } catch (e) {
-          console.warn('Failed to emit balise_captured socket event:', e?.message || e);
+          console.warn("Failed to emit balise_captured socket event:", e?.message || e);
         }
-        toRemove.push(balise.id);
       }
+    } else if (inside.length) {
+      const starter = inside[0];
+      balise.beingCapturedBy = starter.sessionId;
+      balise.captureProgress = 1000;
     } else {
       balise.beingCapturedBy = null;
       balise.captureProgress = 0;
     }
   }
-  
-  // Remove captured or expired balises
+
   if (toRemove.length > 0) {
-    room.balises = room.balises.filter(b => !toRemove.includes(b.id));
-    // Immediately spawn a new balise if one was captured
-    if (!room.baliseSpawnPending) {
-      room.baliseSpawnPending = true;
-      room.lastBaliseSpawnAt = now;
-      spawnBalise(room, room.lastBaliseSpawnAt)
-        .catch((e) => {
-          console.warn("Erreur création balise après capture:", e?.message || e);
-        })
-        .finally(() => {
-          room.baliseSpawnPending = false;
-        });
-    }
+    room.balises = room.balises.filter((b) => !toRemove.includes(b.id));
+  }
+
+  const live = (room.balises || []).filter((b) => !b.expiresAt || now < b.expiresAt);
+  if (live.length < BALISE_TARGET_COUNT && !room.baliseSpawnPending) {
+    room.baliseSpawnPending = true;
+    room.lastBaliseSpawnAt = now;
+    spawnBalise(room, now)
+      .catch((e) => {
+        console.warn("Erreur création balise:", e?.message || e);
+      })
+      .finally(() => {
+        room.baliseSpawnPending = false;
+      });
   }
 }
 
@@ -2180,7 +2327,13 @@ export function createRoomsStore({
       adminPreyPreview: null,
       partyChat: [...(room.partyChat || [])].slice(-80),
       balises: room.balises || [],
-      nextBaliseAt: room.lastBaliseSpawnAt ? room.lastBaliseSpawnAt + 2 * 60 * 1000 : null,
+      nextBaliseAt: (() => {
+        const live = (room.balises || []).filter((b) => !b.expiresAt || now < b.expiresAt);
+        if (live.length < 3) return now;
+        const times = live.map((b) => b.expiresAt).filter((t) => Number.isFinite(t));
+        return times.length ? Math.min(...times) : (room.lastBaliseSpawnAt ? room.lastBaliseSpawnAt + 2 * 60 * 1000 : null);
+      })(),
+      maxPowerSec: maxPowerSecForRoom(room),
       powerLimits: room.powerMaxUses || {},
       powerUses: room.powerUses?.[viewer.sessionId] || {},
     };
@@ -3095,6 +3248,13 @@ export function createRoomsStore({
     const getPowerUses = (p, key) => {
       return Number(room.powerUses?.[p.sessionId]?.[key] || 0);
     };
+    const chargePower = (p, kindKey, cost, powerName = kindKey) => {
+      const used = getPowerUses(p, kindKey);
+      const actual = SIMPLE_FREE_POWER_KINDS.has(kindKey) && used === 0 ? 0 : Math.max(0, Number(cost) || 0);
+      if (actual > 0 && !ensureCoins(p, actual, powerName)) return false;
+      incPowerUse(p, kindKey);
+      return true;
+    };
 
     if (kind === "balise_leurre") {
       // Pouvoir spécial de chat : programmer la prochaine balise comme un leurre
@@ -3115,15 +3275,13 @@ export function createRoomsStore({
       }
 
       const cost = Number(room.powerCosts?.balise_leurre || 60);
-      if (!ensureCoins(actor, cost, "balise_leurre")) return { error: "Pas assez de pièces." };
+      if (!chargePower(actor, "balise_leurre", cost, "balise_leurre")) return { error: "Pas assez de pièces." };
 
       room.nextBaliseOverride = {
         lat,
         lng,
         bySessionId: actor.sessionId,
       };
-
-      incPowerUse(actor, "balise_leurre");
       broadcastPlayingState(io, room);
       return { ok: true };
     }
@@ -3143,22 +3301,25 @@ export function createRoomsStore({
         .filter((t) => t && t.sessionId !== actor.sessionId);
       if (!targets.length) return { error: "Cible introuvable." };
 
+      const maxSec = maxPowerSecForRoom(room);
       let durationSec = Number(body?.durationSec) || 30;
-      if (durationSec <= 10) durationSec = 10;
-      else if (durationSec >= 60) durationSec = 60;
-      else durationSec = 30;
+      if (durationSec <= 10) durationSec = Math.min(10, maxSec);
+      else if (durationSec >= 60) durationSec = Math.min(60, maxSec);
+      else durationSec = Math.min(30, maxSec);
+      durationSec = Math.max(1, durationSec);
 
       const volRaw = String(body?.volume || "medium");
       const volume = volRaw === "low" || volRaw === "high" ? volRaw : "medium";
 
-      const durationFactor = durationSec === 10 ? 0.5 : durationSec === 60 ? 1.8 : 1.0;
+      const longest = Math.min(60, maxSec);
+      const durationFactor = durationSec <= 10 ? 0.5 : durationSec >= longest ? 1.8 : 1.0;
       const volumeFactor = volume === "low" ? 0.7 : volume === "high" ? 1.4 : 1.0;
       const count = targets.length;
       const rawCost = baseCost * durationFactor * volumeFactor * count;
       const cost = Math.max(1, Math.ceil(rawCost));
 
       if (onCooldown(actor, "noise")) return { error: "Bruit en recharge." };
-      if (!ensureCoins(actor, cost, "noise")) return { error: "Pas assez de pièces." };
+      if (!chargePower(actor, "noise", cost, "noise")) return { error: "Pas assez de pièces." };
 
       for (const t of targets) {
         const sock = io.sockets.sockets.get(t.socketId);
@@ -3204,9 +3365,9 @@ export function createRoomsStore({
 
     if (kind === "invisibility") {
       const scope = String(body?.scope || "self"); // self | single | multi | all_role
-      const durationSec = Math.max(30, Math.min(900, Number(body?.durationSec) || 300));
+      const durationSec = clampPowerDuration(body?.durationSec, room, 15, 60);
       const until = now + durationSec * 1000;
-      const durationFactor = Math.pow(durationSec / 300, 1.6); // 5 minutes = coût de base
+      const durationFactor = durationFactor60(durationSec); // 60s = coût de base
       let targets = [];
       if (scope === "self") targets = [actor];
       else if (scope === "single") {
@@ -3234,7 +3395,7 @@ export function createRoomsStore({
         cost = Math.max(1, Math.round(base * durationFactor));
       }
       if (onCooldown(actor, "invisibility")) return { error: "Invisibilité en recharge." };
-      if (!ensureCoins(actor, cost)) return { error: "Pas assez de pièces." };
+      if (!chargePower(actor, "invisibility", cost, "invisibility")) return { error: "Pas assez de pièces." };
       for (const t of targets) {
         t.invisUntil = until;
         t.invisSince = now;
@@ -3373,7 +3534,7 @@ export function createRoomsStore({
       }
       if (onCooldown(actor, "no_boundaries")) return { error: "Recharge en cours." };
       if (!ensureCoins(actor, Number(room.powerCosts?.no_boundaries || 80))) return { error: "Pas assez de pièces." };
-      const durationSec = Math.max(60, Math.min(1800, Number(body?.durationSec) || 600));
+      const durationSec = clampPowerDuration(body?.durationSec, room, 30, 60);
       actor.outOfBoundsOverrideUntil = now + durationSec * 1000;
       pushTimeline(room, { type: "power_no_boundaries", bySessionId: actor.sessionId, durationSec });
       setCooldown(actor, "no_boundaries", 300);
@@ -3384,7 +3545,7 @@ export function createRoomsStore({
     if (kind === "freeze_cats") {
       if (actor.role !== "player") return { error: "Réservé aux joueurs." };
       const scope = String(body?.scope || "single"); // single | multi | all
-      const durationSec = Math.max(5, Math.min(120, Number(body?.durationSec) || 20));
+      const durationSec = clampPowerDuration(body?.durationSec, room, 5, 20);
       let targets = [];
       if (scope === "single") {
         const sid = String(body?.targetSessionId || "");
@@ -3403,7 +3564,7 @@ export function createRoomsStore({
           ? Number(room.powerCosts?.freeze_cats_multi || 80)
           : Number(room.powerCosts?.freeze_cats_all || 140);
       if (onCooldown(actor, "freeze_cats")) return { error: "Recharge en cours." };
-      if (!ensureCoins(actor, cost)) return { error: "Pas assez de pièces." };
+      if (!chargePower(actor, "freeze_cats", cost, "freeze_cats")) return { error: "Pas assez de pièces." };
       const until = now + durationSec * 1000;
       for (const t of targets) {
         t.movementLockedUntil = Math.max(Number(t.movementLockedUntil || 0), until);
@@ -3431,10 +3592,10 @@ export function createRoomsStore({
       if (actor.role !== "player") return { error: "Réservé aux joueurs." };
       if (onCooldown(actor, "fake_position")) return { error: "Leurre en recharge." };
 
-      const durationSec = Math.max(30, Math.min(300, Number(body?.durationSec) || 60));
+      const durationSec = clampPowerDuration(body?.durationSec, room, 15, 60);
       const cost = Number(room.powerCosts?.fake_position || 60);
 
-      if (!ensureCoins(actor, cost, "fake_position")) return { error: "Pas assez de pièces." };
+      if (!chargePower(actor, "fake_position", cost, "fake_position")) return { error: "Pas assez de pièces." };
 
       // La fausse position commence à la position réelle du joueur
       // Elle bougera ensuite de manière aléatoire mais crédible
