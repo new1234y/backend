@@ -836,16 +836,20 @@ async function spawnBalise(room, spawnAt = null) {
   return balise;
 }
 
-function notifyBaliseBlocked(room, io, player, message) {
+function notifyBaliseBlocked(room, io, player, message, capturerNickname) {
   if (!io || !player) return;
   const now = Date.now();
   if (!room._baliseBlockedAt) room._baliseBlockedAt = {};
   const key = String(player.sessionId);
   if (now - (room._baliseBlockedAt[key] || 0) < 4000) return;
   room._baliseBlockedAt[key] = now;
+  const nick = typeof capturerNickname === "string" ? capturerNickname.trim() : "";
   const payload = {
     sessionId: player.sessionId,
-    message: message || "Une personne est déjà en train de la capturer",
+    capturerNickname: nick || null,
+    message: nick
+      ? `${nick} est déjà en train de la capturer`
+      : (message || "Une personne est déjà en train de la capturer"),
   };
   try {
     const sock = io.sockets.sockets.get(player.socketId);
@@ -884,7 +888,7 @@ function updateBalises(room, io) {
     if (capturer) {
       for (const p of inside) {
         if (p.sessionId !== capturer.sessionId) {
-          notifyBaliseBlocked(room, io, p, "Une personne est déjà en train de la capturer");
+          notifyBaliseBlocked(room, io, p, "Une personne est déjà en train de la capturer", capturer.nickname);
         }
       }
       balise.captureProgress += 1000;
