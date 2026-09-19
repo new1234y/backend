@@ -542,7 +542,7 @@ io.on("connection", (socket) => {
 
   /** Étape 2 : la chasse commence (délai carte pour les chats) */
   socket.on("begin_hunt", (_data, cb) => {
-    const out = store.beginHunt(socket.id);
+    const out = store.beginHunt(socket.id, io);
     if (out.error) {
       cb?.({ ok: false, error: out.error });
       return;

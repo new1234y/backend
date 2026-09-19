@@ -1964,7 +1964,7 @@ export function createRoomsStore({
     return { ok: true, room };
   }
 
-  function beginHunt(socketId) {
+  function beginHunt(socketId, io) {
     const code = socketToRoom.get(socketId);
     if (!code) {
       return { error: "Pas dans une salle." };
@@ -1997,6 +1997,15 @@ export function createRoomsStore({
     }
     room.phase = "playing";
     room.huntStartedAt = Date.now();
+    const notificationPermissionPayload = {
+      title: "Notifications de partie",
+      message: "Autorisez les notifications pour être alerté si un pouvoir vous affecte ou si la connexion est perdue.",
+      version: 1,
+    };
+    for (const player of room.players.values()) {
+      const playerSocket = io?.sockets?.sockets?.get(player.socketId);
+      playerSocket?.emit("notification_permission_request", notificationPermissionPayload);
+    }
     
     // Generate Fortnite-like shrink zones
     if (room.settings.shrinkZoneEnabled) {
