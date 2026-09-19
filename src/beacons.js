@@ -1,4 +1,4 @@
-import { haversineMeters } from "./geo.js";
+import { haversineMeters, offsetMeters } from "./geo.js";
 
 const DEFAULT_OVERPASS_URL = "https://overpass-api.de/api/interpreter";
 const DEFAULT_OVERPASS_URLS = [
@@ -156,6 +156,26 @@ function isSafe(point, center, radiusM, options) {
     haversineMeters(point.lat, point.lng, beacon.lat, beacon.lng) < spacing
   )) return false;
   return true;
+}
+
+export function createFallbackBeaconPosition(center, radiusM, options = {}) {
+  const attempts = options.fallbackAttempts || 80;
+  const usableRadius = Math.max(1, Number(radiusM) - Number(options.beaconRadiusM || 0));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const distance = Math.sqrt(Math.random()) * usableRadius;
+    const point = offsetMeters(
+      Number(center.lat),
+      Number(center.lng),
+      Math.random() * 360,
+      distance,
+    );
+    if (isSafe(point, center, Number(radiusM), options)) {
+      return { ...point, source: "local_fallback" };
+    }
+  }
+  throw Object.assign(new Error("Aucune position locale de secours ne respecte les contraintes."), {
+    code: "NO_SAFE_LOCAL_BEACON_POSITION",
+  });
 }
 
 export async function findAccessibleBeaconPosition(center, radiusM, options = {}) {
