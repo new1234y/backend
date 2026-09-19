@@ -1,10 +1,17 @@
 import { haversineMeters } from "./geo.js";
 
 const DEFAULT_OVERPASS_URL = "https://overpass-api.de/api/interpreter";
+const DEFAULT_OVERPASS_URLS = [
+  DEFAULT_OVERPASS_URL,
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.openstreetmap.ru/api/interpreter",
+];
 const DEFAULT_CACHE_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 8_000;
 const DEFAULT_MAX_ATTEMPTS = 2;
+const DEFAULT_FAILURE_CACHE_TTL_MS = 30 * 1000;
 const cache = new Map();
+const failureCache = new Map();
 
 function validCoordinate(point) {
   return point &&
@@ -72,6 +79,8 @@ async function fetchCandidates(center, radiusM, options) {
   const now = Date.now();
   const cached = cache.get(key);
   if (cached && now - cached.at < options.cacheTtlMs) return cached.data;
+  const failed = failureCache.get(key);
+  if (failed && now - failed.at < options.failureCacheTtlMs) throw failed.error;
 
   const radius = Math.max(50, Math.min(1_200, Math.round(radiusM)));
   const query = `[out:json][timeout:8];(
@@ -83,7 +92,13 @@ async function fetchCandidates(center, radiusM, options) {
     way(around:${radius},${center.lat},${center.lng})["landuse"~"^(farmland|farmyard|quarry|industrial)$"];
   );out center geom;`;
 
-  const urls = options.overpassUrls?.length ? options.overpassUrls : [options.overpassUrl || process.env.OVERPASS_URL || DEFAULT_OVERPASS_URL];
+  const urls = options.overpassUrls?.length
+    ? options.overpassUrls
+    : options.overpassUrl
+      ? [options.overpassUrl]
+      : process.env.OVERPASS_URL
+        ? [process.env.OVERPASS_URL, ...DEFAULT_OVERPASS_URLS.filter((url) => url !== process.env.OVERPASS_URL)]
+        : DEFAULT_OVERPASS_URLS;
   let lastError = null;
   for (const url of urls) {
     for (let attempt = 0; attempt < options.maxAttempts; attempt += 1) {
@@ -117,7 +132,12 @@ async function fetchCandidates(center, radiusM, options) {
       }
     }
   }
-  throw Object.assign(new Error(`Placement OSM indisponible: ${lastError?.message || "erreur réseau"}`), { code: "OSM_UNAVAILABLE" });
+  const error = Object.assign(
+    new Error(`Placement OSM indisponible: ${lastError?.message || "erreur réseau"}`),
+    { code: "OSM_UNAVAILABLE" },
+  );
+  failureCache.set(key, { at: Date.now(), error });
+  throw error;
 }
 
 function isSafe(point, center, radiusM, options) {
@@ -146,6 +166,7 @@ export async function findAccessibleBeaconPosition(center, radiusM, options = {}
     cacheTtlMs: DEFAULT_CACHE_TTL_MS,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     maxAttempts: DEFAULT_MAX_ATTEMPTS,
+    failureCacheTtlMs: DEFAULT_FAILURE_CACHE_TTL_MS,
     ...options,
   };
   let data;
@@ -185,4 +206,5 @@ export function beaconCountForPlayers(playerCount, random = Math.random) {
 
 export function clearBeaconPositionCache() {
   cache.clear();
+  failureCache.clear();
 }

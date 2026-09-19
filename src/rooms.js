@@ -25,6 +25,7 @@ const osmBaliseCache = new Map();
 const BALISE_RADIUS_M = 30;
 const BALISE_TTL_MS = 2 * 60 * 1000;
 const BALISE_CAPTURE_DURATION_MS = 20 * 1000;
+const BALISE_PLACEMENT_RETRY_DELAY_MS = 30 * 1000;
 const BALISE_PLAYER_CLEAR_M = 30;
 const BALISE_NEAR_OFFSET_M = 60;
 const BALISE_MIX_NEAR = 0.12;
@@ -851,6 +852,7 @@ async function spawnBalise(room, spawnAt = null) {
       room.nextBaliseOverride = null;
     } catch (error) {
       room.nextBaliseOverride = null;
+      room.lastBalisePlacementErrorAt = Date.now();
       console.warn("Position de leurre refusée:", error?.message || error);
     }
   } else {
@@ -864,6 +866,7 @@ async function spawnBalise(room, spawnAt = null) {
         isInsideZone: (lat, lng) => isInsideGameZone(lat, lng, room),
       });
     } catch (error) {
+      room.lastBalisePlacementErrorAt = Date.now();
       console.warn("Erreur de placement de balise:", error?.message || error);
     }
   }
@@ -892,6 +895,7 @@ async function spawnBalise(room, spawnAt = null) {
     beingCapturedBy: null,
   };
   room.balises.push(balise);
+  room.lastBalisePlacementErrorAt = null;
   pushTimeline(room, {
     type: "balise_spawned",
     baliseId: balise.id,
@@ -1025,11 +1029,14 @@ function updateBalises(room, io) {
 
   const live = (room.balises || []).filter((b) => !b.expiresAt || now < b.expiresAt);
   const targetCount = room.baliseTargetCount || beaconCountForPlayers(gpsPlayers(room).length);
-  if (live.length < targetCount && !room.baliseSpawnPending) {
+  const placementRetryBlocked = room.lastBalisePlacementErrorAt &&
+    now - room.lastBalisePlacementErrorAt < BALISE_PLACEMENT_RETRY_DELAY_MS;
+  if (live.length < targetCount && !room.baliseSpawnPending && !placementRetryBlocked) {
     room.baliseSpawnPending = true;
     room.lastBaliseSpawnAt = now;
     spawnBalise(room, now)
       .catch((e) => {
+        room.lastBalisePlacementErrorAt = Date.now();
         console.warn("Erreur création balise:", e?.message || e);
       })
       .finally(() => {
@@ -1589,6 +1596,7 @@ export function createRoomsStore({
       balises: [],
       baliseTargetCount: 0,
       goldBaliseSpawned: false,
+      lastBalisePlacementErrorAt: null,
       lastBaliseSpawnAt: null,
       nextBaliseOverride: null,
       powerZoneScale: 1,
