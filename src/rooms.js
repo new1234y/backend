@@ -1737,7 +1737,8 @@ export function createRoomsStore({
                 foundPlayer.noiseEffect = {
                   startedAt: new Date(power.started_at).getTime(),
                   durationSec: powerData.durationSec,
-                  volume: powerData.volume,
+                  volume: "high",
+                  audioPolicy: "strongest",
                   by: powerData.by
                 };
               } else if (powerType === "invisibility") {
@@ -3475,14 +3476,13 @@ export function createRoomsStore({
       if (!targets.length) return { error: "Cible introuvable." };
 
       const maxSec = maxPowerSecForRoom(room);
-      let durationSec = Number(body?.durationSec) || 30;
-      if (durationSec <= 10) durationSec = Math.min(10, maxSec);
-      else if (durationSec >= 60) durationSec = Math.min(60, maxSec);
-      else durationSec = Math.min(30, maxSec);
-      durationSec = Math.max(1, durationSec);
-
-      const volRaw = String(body?.volume || "medium");
-      const volume = volRaw === "low" || volRaw === "high" ? volRaw : "medium";
+      const requestedDuration = Number(body?.durationSec);
+      const durationSec = Math.max(
+        1,
+        Math.min(20, Number.isFinite(requestedDuration) && requestedDuration > 0 ? Math.round(requestedDuration) : 20)
+      );
+      const volume = "high";
+      const audioPolicy = "strongest";
 
       const longest = Math.min(60, maxSec);
       const durationFactor = durationSec <= 10 ? 0.5 : durationSec >= longest ? 1.8 : 1.0;
@@ -3496,12 +3496,13 @@ export function createRoomsStore({
 
       for (const t of targets) {
         const sock = io.sockets.sockets.get(t.socketId);
-        sock?.emit("play_noise", { durationSec, volume, by: actor.nickname });
+        sock?.emit("play_noise", { durationSec, volume, audioPolicy, by: actor.nickname });
         // Store noise effect on player for persistence across page refreshes
         t.noiseEffect = {
           startedAt: now,
           durationSec,
           volume,
+          audioPolicy,
           by: actor.nickname
         };
         // Send game notification only to the impacted player
@@ -3509,6 +3510,7 @@ export function createRoomsStore({
           kind: "noise",
           durationSec,
           volume,
+          audioPolicy,
           by: actor.nickname
         });
         // Save to Supabase for persistence
@@ -3517,7 +3519,7 @@ export function createRoomsStore({
           t.sessionId,
           t.nickname,
           "noise",
-          { durationSec, volume, by: actor.nickname },
+          { durationSec, volume, audioPolicy, by: actor.nickname },
           now,
           now + durationSec * 1000
         ).catch(e => console.error('Failed to save noise power to Supabase:', e));
