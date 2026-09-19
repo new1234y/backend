@@ -1634,6 +1634,7 @@ export function createRoomsStore({
       invisFrozenLat: null,
       invisFrozenLng: null,
       movementLockedUntil: null,
+      compassUnlocked: false,
       outOfBoundsOverrideUntil: null,
       outOfBoundsSince: null,
       lastCoinsLostAtBounds: 0,
@@ -1667,15 +1668,17 @@ export function createRoomsStore({
         zone_morph_player: 120,
         zone_morph_cat: 100,
         no_boundaries: 80,
-        freeze_cats_single: 45,
+        freeze_cats_single: 90,
         freeze_cats_multi: 80,
         freeze_cats_all: 140,
         balise_leurre: 60,
         fake_position: 60,
+        compass: 90,
       },
       powerUses: {}, // { [sessionId]: { [powerKey]: count } }
       powerMaxUses: {
         balise_leurre: 1,
+        compass: 1,
       },
       jamRadiusBaseM: Number(settings.jamRadiusM || 80),
       jamRadiusScale: 1,
@@ -1731,6 +1734,10 @@ export function createRoomsStore({
               const powerData = power.power_data;
               const endsAt = new Date(power.ends_at).getTime();
               
+              if (powerType === "compass") {
+                foundPlayer.compassUnlocked = true;
+                continue;
+              }
               if (endsAt <= now) continue; // Skip expired powers
               
               if (powerType === "noise") {
@@ -1803,6 +1810,7 @@ export function createRoomsStore({
       invisFrozenLat: null,
       invisFrozenLng: null,
       movementLockedUntil: null,
+      compassUnlocked: false,
       outOfBoundsOverrideUntil: null,
       outOfBoundsSince: null,
       lastCoinsLostAtBounds: 0,
@@ -2500,7 +2508,9 @@ export function createRoomsStore({
         powerCooldowns: viewer.powerCooldowns || {},
         fakePosition: viewer.fakePosition || null,
         noiseEffect: viewer.noiseEffect && (now - viewer.noiseEffect.startedAt) <= viewer.noiseEffect.durationSec * 1000 ? viewer.noiseEffect : null,
+        compassUnlocked: Boolean(viewer.compassUnlocked),
       },
+      compassTarget: null,
       myJamCircle: null,
       allies: [],
       catsExact: [],
@@ -2523,6 +2533,46 @@ export function createRoomsStore({
 
     if (catMapLocked) {
       return payload;
+    }
+
+    if (
+      viewer.role === "cat" &&
+      viewer.compassUnlocked &&
+      Number.isFinite(viewer.lat) &&
+      Number.isFinite(viewer.lng) &&
+      !viewer.spectator &&
+      !viewer.captured
+    ) {
+      const compassCandidates = [];
+      for (const p of room.players.values()) {
+        if (
+          p.role !== "player" ||
+          p.spectator ||
+          p.captured ||
+          (p.invisUntil != null && now < p.invisUntil) ||
+          !Number.isFinite(p.lat) ||
+          !Number.isFinite(p.lng)
+        ) continue;
+        const hasFakePosition = p.fakePosition && now < p.fakePosition.until;
+        const jamCenter = hasFakePosition
+          ? (p.fakePosition.jamCircleCenter || { lat: p.fakePosition.lat, lng: p.fakePosition.lng })
+          : p.jamCircleCenter;
+        if (!jamCenter || !Number.isFinite(jamCenter.lat) || !Number.isFinite(jamCenter.lng)) continue;
+        const jamDistance = haversineMeters(viewer.lat, viewer.lng, jamCenter.lat, jamCenter.lng);
+        if (jamDistance <= Number(jamRadiusM || 80)) {
+          compassCandidates.push({
+            distanceM: jamDistance,
+            bearing: bearingDeg(viewer, jamCenter),
+          });
+        }
+      }
+      compassCandidates.sort((a, b) => a.distanceM - b.distanceM);
+      if (compassCandidates.length) {
+        payload.compassTarget = {
+          bearing: Math.round(compassCandidates[0].bearing * 10) / 10,
+          distanceM: Math.round(compassCandidates[0].distanceM),
+        };
+      }
     }
 
     const viewerInvisActive = viewer.invisUntil != null && Date.now() < viewer.invisUntil;
@@ -3267,6 +3317,7 @@ export function createRoomsStore({
       invisFrozenLat: null,
       invisFrozenLng: null,
       movementLockedUntil: null,
+      compassUnlocked: false,
       outOfBoundsOverrideUntil: null,
       powerCooldowns: {},
     };
@@ -3470,6 +3521,7 @@ export function createRoomsStore({
     }
 
     if (kind === "noise") {
+      if (actor.role !== "cat") return { error: "Réservé aux chats." };
       // Multiple targets, duration presets and volume all influence the cost
       const baseCost = Number(room.powerCosts?.noise || 20);
 
@@ -3481,7 +3533,7 @@ export function createRoomsStore({
       }
       const targets = targetIds
         .map((sid) => findBySessionId(sid))
-        .filter((t) => t && t.sessionId !== actor.sessionId);
+        .filter((t) => t && t.sessionId !== actor.sessionId && t.role === "player" && !t.spectator);
       if (!targets.length) return { error: "Cible introuvable." };
 
       const maxSec = maxPowerSecForRoom(room);
@@ -3548,36 +3600,19 @@ export function createRoomsStore({
     }
 
     if (kind === "invisibility") {
-      const scope = String(body?.scope || "self"); // self | single | multi | all_role
-      const durationSec = clampPowerDuration(body?.durationSec, room, 15, 60);
+      if (actor.role !== "cat" && actor.role !== "player") return { error: "Rôle invalide." };
+      const scope = String(body?.scope || "self");
+      if (scope !== "self") return { error: "L'invisibilité ne peut cibler que soi-même." };
+      if (body?.targetSessionId != null || Array.isArray(body?.targetSessionIds)) {
+        return { error: "L'invisibilité ne peut cibler que soi-même." };
+      }
+      const durationSec = Math.min(90, clampPowerDuration(body?.durationSec, room, 15, 60));
       const until = now + durationSec * 1000;
       const durationFactor = durationFactor60(durationSec); // 60s = coût de base
-      let targets = [];
-      if (scope === "self") targets = [actor];
-      else if (scope === "single") {
-        const sid = String(body?.targetSessionId || "");
-        const t = findBySessionId(sid);
-        if (!t) return { error: "Cible introuvable." };
-        targets = [t];
-      } else if (scope === "multi") {
-        const ids = Array.isArray(body?.targetSessionIds) ? body.targetSessionIds : [];
-        targets = ids.map(findBySessionId).filter(Boolean);
-      } else if (scope === "all_role") {
-        targets = [...room.players.values()].filter((p) => p.role === actor.role && !p.spectator);
-      } else return { error: "Portée invalide." };
+      const targets = [actor];
 
-      let cost = 0;
-      if (scope === "self") {
-        const base = Number(room.powerCosts?.invisibility_self || 40);
-        cost = Math.max(1, Math.round(base * durationFactor));
-      } else if (scope === "single" || scope === "multi") {
-        const base = Number(room.powerCosts?.invisibility_single || 70);
-        const perTarget = Math.max(1, Math.round(base * durationFactor));
-        cost = perTarget * Math.max(1, targets.length);
-      } else {
-        const base = Number(room.powerCosts?.invisibility_all_role || 130);
-        cost = Math.max(1, Math.round(base * durationFactor));
-      }
+      const base = Number(room.powerCosts?.invisibility_self || 40);
+      const cost = Math.max(1, Math.round(base * durationFactor));
       if (onCooldown(actor, "invisibility")) return { error: "Invisibilité en recharge." };
       if (!chargePower(actor, "invisibility", cost, "invisibility")) return { error: "Pas assez de pièces." };
       for (const t of targets) {
@@ -3727,26 +3762,19 @@ export function createRoomsStore({
     }
 
     if (kind === "freeze_cats") {
-      if (actor.role !== "player") return { error: "Réservé aux joueurs." };
-      const scope = String(body?.scope || "single"); // single | multi | all
+      if (actor.role !== "cat" && actor.role !== "player") return { error: "Rôle invalide." };
+      const scope = String(body?.scope || "single");
+      if (scope !== "single" || Array.isArray(body?.targetSessionIds)) {
+        return { error: "Une seule cible explicite est autorisée." };
+      }
       const durationSec = clampPowerDuration(body?.durationSec, room, 5, 20);
-      let targets = [];
-      if (scope === "single") {
-        const sid = String(body?.targetSessionId || "");
-        const t = findBySessionId(sid);
-        if (!t) return { error: "Cible introuvable." };
-        targets = [t];
-      } else if (scope === "multi") {
-        const ids = Array.isArray(body?.targetSessionIds) ? body.targetSessionIds : [];
-        targets = ids.map(findBySessionId).filter(Boolean);
-      } else if (scope === "all") {
-        targets = [...room.players.values()].filter((p) => p.sessionId !== actor.sessionId && !p.spectator);
-      } else return { error: "Portée invalide." };
-      const cost = scope === "single"
-        ? Number(room.powerCosts?.freeze_cats_single || 45)
-        : scope === "multi"
-          ? Number(room.powerCosts?.freeze_cats_multi || 80)
-          : Number(room.powerCosts?.freeze_cats_all || 140);
+      const sid = String(body?.targetSessionId || "");
+      const target = findBySessionId(sid);
+      if (!target || target.spectator || target.role !== (actor.role === "cat" ? "player" : "cat")) {
+        return { error: "Cible adverse introuvable." };
+      }
+      const targets = [target];
+      const cost = Number(room.powerCosts?.freeze_cats_single || 90);
       if (onCooldown(actor, "freeze_cats")) return { error: "Recharge en cours." };
       if (!chargePower(actor, "freeze_cats", cost, "freeze_cats")) return { error: "Pas assez de pièces." };
       const until = now + durationSec * 1000;
@@ -3771,9 +3799,39 @@ export function createRoomsStore({
       return { ok: true };
     }
 
+    if (kind === "compass") {
+      if (actor.role !== "cat") return { error: "Réservé aux chats." };
+      if (actor.compassUnlocked || getPowerUses(actor, "compass") >= 1) {
+        return { error: "Boussole déjà débloquée." };
+      }
+      const cost = Number(room.powerCosts?.compass || 90);
+      if (!chargePower(actor, "compass", cost, "compass")) return { error: "Pas assez de pièces." };
+      actor.compassUnlocked = true;
+      const permanentUntil = now + 10 * 365 * 24 * 60 * 60 * 1000;
+      saveActivePower(
+        room.code,
+        actor.sessionId,
+        actor.nickname,
+        "compass",
+        { permanent: true },
+        now,
+        permanentUntil
+      ).catch(e => console.error("Failed to save compass power to Supabase:", e));
+      pushTimeline(room, { type: "power_compass", bySessionId: actor.sessionId, cost });
+      broadcastPlayingState(io, room);
+      return { ok: true };
+    }
+
     if (kind === "fake_position") {
       // Pouvoir de leurre de position : affiche une fausse position aux autres joueurs
       if (actor.role !== "player") return { error: "Réservé aux joueurs." };
+      if (
+        (body?.scope != null && String(body.scope) !== "self") ||
+        body?.targetSessionId != null ||
+        Array.isArray(body?.targetSessionIds)
+      ) {
+        return { error: "Le leurre ne peut cibler que soi-même." };
+      }
       if (onCooldown(actor, "fake_position")) return { error: "Leurre en recharge." };
 
       const durationSec = clampPowerDuration(body?.durationSec, room, 15, 60);
@@ -3850,6 +3908,7 @@ export function createRoomsStore({
       "freeze_cats_multi",
       "freeze_cats_all",
       "fake_position",
+      "compass",
     ];
     for (const k of valid) {
       if (partialCosts && partialCosts[k] != null) {
