@@ -29,6 +29,12 @@ const osmBaliseCache = new Map();
 const BALISE_RADIUS_M = 30;
 const BALISE_TTL_MS = 2 * 60 * 1000;
 const BALISE_CAPTURE_DURATION_MS = 20 * 1000;
+const BALISE_PROFILE = {
+  normal: { ttlMs: 2 * 60 * 1000, captureMs: 20 * 1000, coins: 120, rarity: "commune", progressColor: "#22c55e" },
+  circular: { ttlMs: 4 * 60 * 1000, captureMs: 30 * 1000, coins: 180, rarity: "peu commune", progressColor: "#a855f7" },
+  distant: { ttlMs: 5 * 60 * 1000, captureMs: 40 * 1000, coins: 260, rarity: "rare", progressColor: "#3b82f6" },
+  gold: { ttlMs: 6 * 60 * 1000, captureMs: 60 * 1000, coins: 600, rarity: "légendaire", progressColor: "#f59e0b" },
+};
 const BALISE_PLACEMENT_RETRY_DELAY_MS = 30 * 1000;
 const BALISE_PLAYER_CLEAR_M = 30;
 const BALISE_NEAR_OFFSET_M = 60;
@@ -65,9 +71,7 @@ function baliseTypeForSpawn(room, mixKind) {
 }
 
 function baliseRarity(type) {
-  if (type === "gold") return "legendary";
-  if (type === "distant" || type === "circular") return "rare";
-  return "common";
+  return BALISE_PROFILE[type]?.rarity || BALISE_PROFILE.normal.rarity;
 }
 
 function serializeBalises(room) {
@@ -78,13 +82,15 @@ function serializeBalises(room) {
     if (type === "gold") goldSeen = true;
     const awardedCoins = Number.isFinite(Number(balise.awardedCoins))
       ? Number(balise.awardedCoins)
-      : Number(balise.rewardCoins) || (type === "gold" ? 50 : 20);
+      : Number(balise.rewardCoins) || BALISE_PROFILE[type].coins;
     return {
       ...balise,
       type,
       rarity: balise.rarity || baliseRarity(type),
-      captureDurationMs: Number(balise.captureDurationMs) || BALISE_CAPTURE_DURATION_MS,
+      captureDurationMs: Number(balise.captureDurationMs) || BALISE_PROFILE[type].captureMs,
       awardedCoins,
+      progressColor: balise.progressColor || BALISE_PROFILE[type].progressColor,
+      isDecoy: Boolean(balise.isDecoy),
       lat: Number(balise.lat),
       lng: Number(balise.lng),
       expiresAt: Number(balise.expiresAt) || null,
@@ -93,8 +99,10 @@ function serializeBalises(room) {
 }
 
 function createBaliseRecord(room, position, mixKind, now) {
-  const type = baliseTypeForSpawn(room, mixKind);
-  const awardedCoins = type === "gold" ? 50 : 20;
+  const isDecoy = position.source === "override_cat" || position.isDecoy === true;
+  const type = isDecoy ? "normal" : baliseTypeForSpawn(room, mixKind);
+  const profile = BALISE_PROFILE[type] || BALISE_PROFILE.normal;
+  const awardedCoins = isDecoy ? 0 : profile.coins;
   return {
     id: uuidv4(),
     lat: position.lat,
@@ -103,13 +111,16 @@ function createBaliseRecord(room, position, mixKind, now) {
     visualScale: 1,
     placementHint: position.source === "osm" ? "osm_routable_way" : position.source || "local_fallback",
     type,
-    rarity: baliseRarity(type),
-    captureDurationMs: BALISE_CAPTURE_DURATION_MS,
+    rarity: isDecoy ? "leurre" : baliseRarity(type),
+    captureDurationMs: profile.captureMs,
+    progressColor: profile.progressColor,
     awardedCoins,
     rewardCoins: awardedCoins,
     osmWayId: position.osmWayId || null,
     createdAt: now,
-    expiresAt: now + BALISE_TTL_MS,
+    expiresAt: now + (isDecoy ? 60 * 1000 : profile.ttlMs),
+    isDecoy,
+    decoyBySessionId: position.bySessionId || null,
     capturedBy: null,
     captureProgress: 0,
     beingCapturedBy: null,
@@ -857,7 +868,10 @@ async function spawnBalise(room, spawnAt = null) {
   if (!Array.isArray(room.balises)) room.balises = [];
   const live = room.balises.filter((b) => !b.expiresAt || now < b.expiresAt);
   const targetCount = room.baliseTargetCount || beaconCountForPlayers(gpsPlayers(room).length);
-  if (live.length >= targetCount) return null;
+  const hasLure = room.nextBaliseOverride &&
+    Number.isFinite(room.nextBaliseOverride.lat) &&
+    Number.isFinite(room.nextBaliseOverride.lng);
+  if (live.length >= targetCount && !hasLure) return null;
 
   const players = gpsPlayers(room);
   let mixKind = sampleBaliseMixKind();
@@ -969,7 +983,6 @@ function updateBalises(room, io) {
   if (room.phase !== "playing") return;
 
   const now = Date.now();
-  const captureTime = BALISE_CAPTURE_DURATION_MS;
   const toRemove = [];
 
   for (const balise of room.balises) {
@@ -999,6 +1012,7 @@ function updateBalises(room, io) {
       }
       room._baliseBlockedId = null;
       balise.captureProgress += 1000;
+      const captureTime = Number(balise.captureDurationMs) || BALISE_CAPTURE_DURATION_MS;
       if (balise.captureProgress >= captureTime) {
         balise.capturedBy = capturer.sessionId;
         balise.beingCapturedBy = null;
@@ -1066,7 +1080,10 @@ function updateBalises(room, io) {
   const targetCount = room.baliseTargetCount || beaconCountForPlayers(gpsPlayers(room).length);
   const placementRetryBlocked = room.lastBalisePlacementErrorAt &&
     now - room.lastBalisePlacementErrorAt < BALISE_PLACEMENT_RETRY_DELAY_MS;
-  if (live.length < targetCount && !room.baliseSpawnPending && !placementRetryBlocked) {
+  const hasLure = room.nextBaliseOverride &&
+    Number.isFinite(room.nextBaliseOverride.lat) &&
+    Number.isFinite(room.nextBaliseOverride.lng);
+  if ((live.length < targetCount || hasLure) && !room.baliseSpawnPending && !placementRetryBlocked) {
     room.baliseSpawnPending = true;
     room.lastBaliseSpawnAt = now;
     spawnBalise(room, now)
