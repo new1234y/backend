@@ -1086,11 +1086,16 @@ function updateBalises(room, io) {
   if ((live.length < targetCount || hasLure) && !room.baliseSpawnPending && !placementRetryBlocked) {
     room.baliseSpawnPending = true;
     room.lastBaliseSpawnAt = now;
-    spawnBalise(room, now)
-      .catch((e) => {
-        room.lastBalisePlacementErrorAt = Date.now();
-        console.warn("Erreur création balise:", e?.message || e);
-      })
+    const missing = Math.max(1, targetCount - live.length);
+    Promise.resolve().then(async () => {
+      for (let i = 0; i < missing; i += 1) {
+        const created = await spawnBalise(room, now);
+        if (!created && !room.nextBaliseOverride) break;
+      }
+    }).catch((e) => {
+      room.lastBalisePlacementErrorAt = Date.now();
+      console.warn("Erreur création balise:", e?.message || e);
+    })
       .finally(() => {
         room.baliseSpawnPending = false;
       });
