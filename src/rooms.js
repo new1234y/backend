@@ -7,6 +7,9 @@ import {
   isInsideAnyPolygon,
   offsetMeters,
 } from "./geo.js";
+import { beaconCountForPlayers, findAccessibleBeaconPosition } from "./beacons.js";
+
+export { beaconCountForPlayers, findAccessibleBeaconPosition };
 
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CAPTURE_DISTANCE_M = 15;
@@ -20,9 +23,8 @@ const OSM_BALISE_CACHE_TTL_MS = 10 * 60 * 1000;
 const osmBaliseCache = new Map();
 
 const BALISE_RADIUS_M = 30;
-const BALISE_TARGET_COUNT = 3;
 const BALISE_TTL_MS = 2 * 60 * 1000;
-const BALISE_PLAYER_CLEAR_M = 15;
+const BALISE_PLAYER_CLEAR_M = 30;
 const BALISE_NEAR_OFFSET_M = 60;
 const BALISE_MIX_NEAR = 0.12;
 const BALISE_MIX_FAR = 0.18;
@@ -31,6 +33,9 @@ const BALISE_FAR_MAX_FRAC = 0.97;
 const BALISE_MIN_SEPARATION_BASE_M = 180;
 const BALISE_MIN_SEPARATION_RADIUS_FRAC = 0.28;
 const BALISE_MIN_SEPARATION_FLOOR_M = 120;
+const DEFAULT_BEACON_SPAWN_DISTANCE_M = Number(process.env.MIN_BEACON_SPAWN_DISTANCE_M) > 0
+  ? Number(process.env.MIN_BEACON_SPAWN_DISTANCE_M)
+  : 30;
 const SIMPLE_FREE_POWER_KINDS = new Set([
   "invisibility",
   "noise",
@@ -309,6 +314,8 @@ const defaultSettings = () => {
   /** random | manual — en manuel, l'hôte définit les chats avant « Démarrer la chasse » */
   catAssignmentMode: "random",
   gameMode: "tag_swap",
+  minBeaconSpacingM: BALISE_MIN_SEPARATION_BASE_M,
+  minBeaconSpawnDistanceM: DEFAULT_BEACON_SPAWN_DISTANCE_M,
   /** Réservé à l'hôte : aperçu carte avec les mêmes cercles que les chats */
   hostCatMapPreview: false,
   };
@@ -751,21 +758,6 @@ async function pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, bal
   return null;
 }
 
-function pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra = {}) {
-  const mixKind = extra.mixKind || "uniform";
-  const blocked = extra.blockedAreas || [];
-  const usableR = usableBaliseRadiusM(effectiveRadius, baliseRadiusM);
-  const tries = extra.sampleTries || 120;
-  for (let i = 0; i < tries; i++) {
-    const candidate = samplePointInPlayCircle(mixKind, effectiveCenter, effectiveRadius, baliseRadiusM, extra);
-    const clamped = clampInsideCircle(candidate, effectiveCenter, effectiveRadius, baliseRadiusM);
-    if (mixKind !== "near" && !candidateMatchesMix(clamped, mixKind, extra, effectiveCenter, usableR)) continue;
-    if (!isOsmCandidateSafe(clamped, blocked, room, effectiveCenter, effectiveRadius, baliseRadiusM, extra)) continue;
-    return { ...clamped, source: "fallback_mix" };
-  }
-  return null;
-}
-
 async function spawnBalise(room, spawnAt = null) {
   if (!room.gameCenter) return;
   const t = Number.isFinite(spawnAt) ? spawnAt : Date.now();
@@ -776,7 +768,8 @@ async function spawnBalise(room, spawnAt = null) {
   const baliseRadiusM = BALISE_RADIUS_M;
   if (!Array.isArray(room.balises)) room.balises = [];
   const live = room.balises.filter((b) => !b.expiresAt || now < b.expiresAt);
-  if (live.length >= BALISE_TARGET_COUNT) return null;
+  const targetCount = room.baliseTargetCount || beaconCountForPlayers(gpsPlayers(room).length);
+  if (live.length >= targetCount) return null;
 
   const players = gpsPlayers(room);
   let mixKind = sampleBaliseMixKind();
@@ -796,19 +789,39 @@ async function spawnBalise(room, spawnAt = null) {
   if (room.nextBaliseOverride &&
       Number.isFinite(room.nextBaliseOverride.lat) &&
       Number.isFinite(room.nextBaliseOverride.lng)) {
-    position = {
-      lat: Number(room.nextBaliseOverride.lat),
-      lng: Number(room.nextBaliseOverride.lng),
-      source: "override_cat",
-      osmWayId: null,
-    };
-    room.nextBaliseOverride = null;
+    try {
+      position = await findAccessibleBeaconPosition(
+        effectiveCenter,
+        effectiveRadius,
+        {
+          existingBeacons: live,
+          players,
+          minBeaconSpacingM: room.settings.minBeaconSpacingM || baliseMinSeparationM(effectiveRadius),
+          minBeaconSpawnDistanceM: room.settings.minBeaconSpawnDistanceM || DEFAULT_BEACON_SPAWN_DISTANCE_M,
+          beaconRadiusM: baliseRadiusM,
+          isInsideZone: (lat, lng) => isInsideGameZone(lat, lng, room),
+          validatedPositions: [room.nextBaliseOverride],
+          onlyValidatedPositions: true,
+        },
+      );
+      if (position) position.source = "override_cat";
+      room.nextBaliseOverride = null;
+    } catch (error) {
+      room.nextBaliseOverride = null;
+      console.warn("Position de leurre refusée:", error?.message || error);
+    }
   } else {
-    for (const sep of separationSteps(baliseMinSeparationM(effectiveRadius))) {
-      const extra = { ...extraBase, minSeparationM: sep };
-      position = await pickOsmBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra) ||
-        pickFallbackBalisePosition(room, effectiveCenter, effectiveRadius, baliseRadiusM, extra);
-      if (position) break;
+    try {
+      position = await findAccessibleBeaconPosition(effectiveCenter, effectiveRadius, {
+        existingBeacons: live,
+        players,
+        minBeaconSpacingM: room.settings.minBeaconSpacingM || baliseMinSeparationM(effectiveRadius),
+        minBeaconSpawnDistanceM: room.settings.minBeaconSpawnDistanceM || DEFAULT_BEACON_SPAWN_DISTANCE_M,
+        beaconRadiusM: baliseRadiusM,
+        isInsideZone: (lat, lng) => isInsideGameZone(lat, lng, room),
+      });
+    } catch (error) {
+      console.warn("Erreur de placement de balise:", error?.message || error);
     }
   }
 
@@ -820,7 +833,9 @@ async function spawnBalise(room, spawnAt = null) {
     lng: position.lng,
     radiusM: baliseRadiusM,
     visualScale: 1,
-    placementHint: position.source === "osm" ? "osm_pedestrian_way" : position.source || "fallback_mix",
+    placementHint: position.source === "osm" ? "osm_routable_way" : position.source || "validated_cache",
+    type: position.source === "override_cat" ? "decoy" : "standard",
+    rewardCoins: position.source === "override_cat" ? 10 : 20,
     osmWayId: position.osmWayId || null,
     createdAt: now,
     expiresAt: now + BALISE_TTL_MS,
@@ -847,6 +862,7 @@ function notifyBaliseBlocked(room, io, player, message, capturerNickname) {
   const payload = {
     sessionId: player.sessionId,
     capturerNickname: nick || null,
+    baliseId: room._baliseBlockedId || null,
     message: nick
       ? `${nick} est déjà en train de la capturer`
       : (message || "Une personne est déjà en train de la capturer"),
@@ -854,6 +870,8 @@ function notifyBaliseBlocked(room, io, player, message, capturerNickname) {
   try {
     const sock = io.sockets.sockets.get(player.socketId);
     sock?.emit("balise_capture_blocked", payload);
+    sock?.emit("beacon_conflict", payload);
+    sock?.emit("balise_conflict", payload);
     sock?.emit("game_notification", { kind: "balise_blocked", ...payload });
   } catch (e) {
     console.warn("Failed to emit balise_capture_blocked:", e?.message || e);
@@ -888,14 +906,16 @@ function updateBalises(room, io) {
     if (capturer) {
       for (const p of inside) {
         if (p.sessionId !== capturer.sessionId) {
+          room._baliseBlockedId = balise.id;
           notifyBaliseBlocked(room, io, p, "Une personne est déjà en train de la capturer", capturer.nickname);
         }
       }
+      room._baliseBlockedId = null;
       balise.captureProgress += 1000;
       if (balise.captureProgress >= captureTime) {
         balise.capturedBy = capturer.sessionId;
         balise.beingCapturedBy = null;
-        const award = 20;
+        const award = Number(balise.rewardCoins) || 20;
         capturer.coins = (capturer.coins || 0) + award;
         recordCoinTransaction(capturer, award, "balise", "Capture de balise");
         pushTimeline(room, {
@@ -914,6 +934,27 @@ function updateBalises(room, io) {
               nickname: capturer.nickname,
               role: capturer.role,
               awardedCoins: award,
+              coins: capturer.coins,
+            });
+            io.to(room.code).emit("balise_coin_awarded", {
+              baliseId: balise.id,
+              sessionId: capturer.sessionId,
+              amount: award,
+              coins: capturer.coins,
+            });
+            io.to(room.code).emit("coin_gain", {
+              sessionId: capturer.sessionId,
+              amount: award,
+              source: "balise",
+              baliseId: balise.id,
+              coins: capturer.coins,
+            });
+            io.to(room.code).emit("coins_gained", {
+              sessionId: capturer.sessionId,
+              amount: award,
+              source: "balise",
+              baliseId: balise.id,
+              coins: capturer.coins,
             });
           }
         } catch (e) {
@@ -935,7 +976,8 @@ function updateBalises(room, io) {
   }
 
   const live = (room.balises || []).filter((b) => !b.expiresAt || now < b.expiresAt);
-  if (live.length < BALISE_TARGET_COUNT && !room.baliseSpawnPending) {
+  const targetCount = room.baliseTargetCount || beaconCountForPlayers(gpsPlayers(room).length);
+  if (live.length < targetCount && !room.baliseSpawnPending) {
     room.baliseSpawnPending = true;
     room.lastBaliseSpawnAt = now;
     spawnBalise(room, now)
@@ -1497,6 +1539,7 @@ export function createRoomsStore({
       pendingJoins: [],
       partyChat: [],
       balises: [],
+      baliseTargetCount: 0,
       lastBaliseSpawnAt: null,
       nextBaliseOverride: null,
       powerZoneScale: 1,
@@ -1674,6 +1717,14 @@ export function createRoomsStore({
     if (partial.jamRadiusM != null) {
       const v = Number(partial.jamRadiusM);
       if (v >= 10 && v <= 500) s.jamRadiusM = v;
+    }
+    if (partial.minBeaconSpacingM != null) {
+      const v = Number(partial.minBeaconSpacingM);
+      if (v >= 50 && v <= 2_000) s.minBeaconSpacingM = v;
+    }
+    if (partial.minBeaconSpawnDistanceM != null) {
+      const v = Number(partial.minBeaconSpawnDistanceM);
+      if (v >= 10 && v <= 500) s.minBeaconSpawnDistanceM = v;
     }
     if (partial.catCount != null) {
       const v = Math.floor(Number(partial.catCount));
@@ -1938,6 +1989,7 @@ export function createRoomsStore({
     room.jamHistory = [];
     room._lastJamSample = {};
     room.balises = [];
+    room.baliseTargetCount = beaconCountForPlayers(list.filter((p) => !p.spectator).length);
     room.initialPlayerCount = list.filter((p) => !p.spectator).length;
     room.initialRemainingPlayerCount = list.filter((p) => p.role === "player" && !p.spectator).length;
     room.lastBaliseSpawnAt = null;
