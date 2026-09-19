@@ -7,7 +7,11 @@ import {
   isInsideAnyPolygon,
   offsetMeters,
 } from "./geo.js";
-import { beaconCountForPlayers, findAccessibleBeaconPosition } from "./beacons.js";
+import {
+  beaconCountForPlayers,
+  createFallbackBeaconPosition,
+  findAccessibleBeaconPosition,
+} from "./beacons.js";
 
 export { beaconCountForPlayers, findAccessibleBeaconPosition };
 
@@ -86,6 +90,46 @@ function serializeBalises(room) {
       expiresAt: Number(balise.expiresAt) || null,
     };
   });
+}
+
+function createBaliseRecord(room, position, mixKind, now) {
+  const type = baliseTypeForSpawn(room, mixKind);
+  const awardedCoins = type === "gold" ? 50 : 20;
+  return {
+    id: uuidv4(),
+    lat: position.lat,
+    lng: position.lng,
+    radiusM: BALISE_RADIUS_M,
+    visualScale: 1,
+    placementHint: position.source === "osm" ? "osm_routable_way" : position.source || "local_fallback",
+    type,
+    rarity: baliseRarity(type),
+    captureDurationMs: BALISE_CAPTURE_DURATION_MS,
+    awardedCoins,
+    rewardCoins: awardedCoins,
+    osmWayId: position.osmWayId || null,
+    createdAt: now,
+    expiresAt: now + BALISE_TTL_MS,
+    capturedBy: null,
+    captureProgress: 0,
+    beingCapturedBy: null,
+  };
+}
+
+function immediateFallbackBalises(room, center, radiusM, count, now) {
+  const players = gpsPlayers(room);
+  for (let i = 0; i < count; i += 1) {
+    const position = createFallbackBeaconPosition(center, radiusM, {
+      existingBeacons: room.balises,
+      players,
+      minBeaconSpacingM: room.settings.minBeaconSpacingM || baliseMinSeparationM(radiusM),
+      minBeaconSpawnDistanceM: room.settings.minBeaconSpawnDistanceM || DEFAULT_BEACON_SPAWN_DISTANCE_M,
+      beaconRadiusM: BALISE_RADIUS_M,
+      isInsideZone: (lat, lng) => isInsideGameZone(lat, lng, room),
+    });
+    const mixKind = i % 3 === 0 ? "far" : i % 3 === 1 ? "near" : "uniform";
+    room.balises.push(createBaliseRecord(room, position, mixKind, now));
+  }
 }
 
 function clampNum(n, min, max) {
@@ -852,7 +896,6 @@ async function spawnBalise(room, spawnAt = null) {
       room.nextBaliseOverride = null;
     } catch (error) {
       room.nextBaliseOverride = null;
-      room.lastBalisePlacementErrorAt = Date.now();
       console.warn("Position de leurre refusée:", error?.message || error);
     }
   } else {
@@ -866,34 +909,26 @@ async function spawnBalise(room, spawnAt = null) {
         isInsideZone: (lat, lng) => isInsideGameZone(lat, lng, room),
       });
     } catch (error) {
-      room.lastBalisePlacementErrorAt = Date.now();
-      console.warn("Erreur de placement de balise:", error?.message || error);
+      console.warn("Erreur de placement OSM, utilisation du fallback local:", error?.message || error);
+      try {
+        position = createFallbackBeaconPosition(effectiveCenter, effectiveRadius, {
+          existingBeacons: live,
+          players,
+          minBeaconSpacingM: room.settings.minBeaconSpacingM || baliseMinSeparationM(effectiveRadius),
+          minBeaconSpawnDistanceM: room.settings.minBeaconSpawnDistanceM || DEFAULT_BEACON_SPAWN_DISTANCE_M,
+          beaconRadiusM: baliseRadiusM,
+          isInsideZone: (lat, lng) => isInsideGameZone(lat, lng, room),
+        });
+      } catch (fallbackError) {
+        room.lastBalisePlacementErrorAt = Date.now();
+        console.warn("Fallback local de balise indisponible:", fallbackError?.message || fallbackError);
+      }
     }
   }
 
   if (!position || !Number.isFinite(position.lat) || !Number.isFinite(position.lng)) return null;
 
-  const type = baliseTypeForSpawn(room, mixKind);
-  const awardedCoins = type === "gold" ? 50 : 20;
-  const balise = {
-    id: uuidv4(),
-    lat: position.lat,
-    lng: position.lng,
-    radiusM: baliseRadiusM,
-    visualScale: 1,
-    placementHint: position.source === "osm" ? "osm_routable_way" : position.source || "validated_cache",
-    type,
-    rarity: baliseRarity(type),
-    captureDurationMs: BALISE_CAPTURE_DURATION_MS,
-    awardedCoins,
-    rewardCoins: awardedCoins,
-    osmWayId: position.osmWayId || null,
-    createdAt: now,
-    expiresAt: now + BALISE_TTL_MS,
-    capturedBy: null,
-    captureProgress: 0,
-    beingCapturedBy: null,
-  };
+  const balise = createBaliseRecord(room, position, mixKind, now);
   room.balises.push(balise);
   room.lastBalisePlacementErrorAt = null;
   pushTimeline(room, {
@@ -2048,6 +2083,17 @@ export function createRoomsStore({
     room.balises = [];
     room.baliseTargetCount = beaconCountForPlayers(list.filter((p) => !p.spectator).length);
     room.goldBaliseSpawned = false;
+    try {
+      immediateFallbackBalises(
+        room,
+        room.gameCenter,
+        getEffectiveGlobalRadius(room),
+        room.baliseTargetCount,
+        Date.now(),
+      );
+    } catch (error) {
+      console.warn("Création immédiate des balises impossible:", error?.message || error);
+    }
     room.initialPlayerCount = list.filter((p) => !p.spectator).length;
     room.initialRemainingPlayerCount = list.filter((p) => p.role === "player" && !p.spectator).length;
     room.lastBaliseSpawnAt = null;
