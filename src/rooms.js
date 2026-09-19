@@ -24,6 +24,7 @@ const osmBaliseCache = new Map();
 
 const BALISE_RADIUS_M = 30;
 const BALISE_TTL_MS = 2 * 60 * 1000;
+const BALISE_CAPTURE_DURATION_MS = 20 * 1000;
 const BALISE_PLAYER_CLEAR_M = 30;
 const BALISE_NEAR_OFFSET_M = 60;
 const BALISE_MIX_NEAR = 0.12;
@@ -43,6 +44,48 @@ const SIMPLE_FREE_POWER_KINDS = new Set([
   "fake_position",
   "balise_leurre",
 ]);
+
+const BALISE_TYPES = new Set(["normal", "distant", "circular", "gold"]);
+
+function baliseTypeForSpawn(room, mixKind) {
+  const hasGold = Boolean(room.goldBaliseSpawned) ||
+    (room.balises || []).some((balise) => balise.type === "gold");
+  if (!hasGold && Math.random() < 0.1) {
+    room.goldBaliseSpawned = true;
+    return "gold";
+  }
+  if (mixKind === "far") return "distant";
+  if (mixKind === "near") return "circular";
+  return "normal";
+}
+
+function baliseRarity(type) {
+  if (type === "gold") return "legendary";
+  if (type === "distant" || type === "circular") return "rare";
+  return "common";
+}
+
+function serializeBalises(room) {
+  let goldSeen = false;
+  return (room.balises || []).map((balise) => {
+    let type = BALISE_TYPES.has(balise.type) ? balise.type : "normal";
+    if (type === "gold" && goldSeen) type = "normal";
+    if (type === "gold") goldSeen = true;
+    const awardedCoins = Number.isFinite(Number(balise.awardedCoins))
+      ? Number(balise.awardedCoins)
+      : Number(balise.rewardCoins) || (type === "gold" ? 50 : 20);
+    return {
+      ...balise,
+      type,
+      rarity: balise.rarity || baliseRarity(type),
+      captureDurationMs: Number(balise.captureDurationMs) || BALISE_CAPTURE_DURATION_MS,
+      awardedCoins,
+      lat: Number(balise.lat),
+      lng: Number(balise.lng),
+      expiresAt: Number(balise.expiresAt) || null,
+    };
+  });
+}
 
 function clampNum(n, min, max) {
   return Math.max(min, Math.min(max, n));
@@ -827,6 +870,8 @@ async function spawnBalise(room, spawnAt = null) {
 
   if (!position || !Number.isFinite(position.lat) || !Number.isFinite(position.lng)) return null;
 
+  const type = baliseTypeForSpawn(room, mixKind);
+  const awardedCoins = type === "gold" ? 50 : 20;
   const balise = {
     id: uuidv4(),
     lat: position.lat,
@@ -834,8 +879,11 @@ async function spawnBalise(room, spawnAt = null) {
     radiusM: baliseRadiusM,
     visualScale: 1,
     placementHint: position.source === "osm" ? "osm_routable_way" : position.source || "validated_cache",
-    type: position.source === "override_cat" ? "decoy" : "standard",
-    rewardCoins: position.source === "override_cat" ? 10 : 20,
+    type,
+    rarity: baliseRarity(type),
+    captureDurationMs: BALISE_CAPTURE_DURATION_MS,
+    awardedCoins,
+    rewardCoins: awardedCoins,
     osmWayId: position.osmWayId || null,
     createdAt: now,
     expiresAt: now + BALISE_TTL_MS,
@@ -882,7 +930,7 @@ function updateBalises(room, io) {
   if (room.phase !== "playing") return;
 
   const now = Date.now();
-  const captureTime = 20 * 1000;
+  const captureTime = BALISE_CAPTURE_DURATION_MS;
   const toRemove = [];
 
   for (const balise of room.balises) {
@@ -915,7 +963,7 @@ function updateBalises(room, io) {
       if (balise.captureProgress >= captureTime) {
         balise.capturedBy = capturer.sessionId;
         balise.beingCapturedBy = null;
-        const award = Number(balise.rewardCoins) || 20;
+        const award = Number(balise.awardedCoins) || Number(balise.rewardCoins) || 20;
         capturer.coins = (capturer.coins || 0) + award;
         recordCoinTransaction(capturer, award, "balise", "Capture de balise");
         pushTimeline(room, {
@@ -1285,7 +1333,7 @@ function buildGameSummary(room) {
           endZone: ph.endZone ? { ...ph.endZone, center: { ...ph.endZone.center } } : null,
         }))
       : null,
-    balises: [...(room.balises || [])],
+    balises: serializeBalises(room),
     analytics,
   };
 }
@@ -1540,6 +1588,7 @@ export function createRoomsStore({
       partyChat: [],
       balises: [],
       baliseTargetCount: 0,
+      goldBaliseSpawned: false,
       lastBaliseSpawnAt: null,
       nextBaliseOverride: null,
       powerZoneScale: 1,
@@ -1990,6 +2039,7 @@ export function createRoomsStore({
     room._lastJamSample = {};
     room.balises = [];
     room.baliseTargetCount = beaconCountForPlayers(list.filter((p) => !p.spectator).length);
+    room.goldBaliseSpawned = false;
     room.initialPlayerCount = list.filter((p) => !p.spectator).length;
     room.initialRemainingPlayerCount = list.filter((p) => p.role === "player" && !p.spectator).length;
     room.lastBaliseSpawnAt = null;
@@ -2372,10 +2422,11 @@ export function createRoomsStore({
       spectators: [],
       adminPreyPreview: null,
       partyChat: [...(room.partyChat || [])].slice(-80),
-      balises: room.balises || [],
+      balises: serializeBalises(room),
       nextBaliseAt: (() => {
         const live = (room.balises || []).filter((b) => !b.expiresAt || now < b.expiresAt);
-        if (live.length < 3) return now;
+        const targetCount = room.baliseTargetCount || beaconCountForPlayers(gpsPlayers(room).length);
+        if (live.length < targetCount) return now;
         const times = live.map((b) => b.expiresAt).filter((t) => Number.isFinite(t));
         return times.length ? Math.min(...times) : (room.lastBaliseSpawnAt ? room.lastBaliseSpawnAt + 2 * 60 * 1000 : null);
       })(),
