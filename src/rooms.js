@@ -12,6 +12,16 @@ import {
   createFallbackBeaconPosition,
   findAccessibleBeaconPosition,
 } from "./beacons.js";
+import {
+  clampPowerDuration,
+  calculateAdaptivePhaseCount,
+  calculateDynamicCatDelay,
+  calculateFinalWaitRatio,
+  calculateForcedWaitForNewCat,
+  defaultSettings,
+  durationFactor60,
+  maxPowerSecForRoom,
+} from "./gameMath.js";
 
 export { beaconCountForPlayers, findAccessibleBeaconPosition };
 
@@ -141,32 +151,6 @@ function immediateFallbackBalises(room, center, radiusM, count, now) {
     const mixKind = i % 3 === 0 ? "far" : i % 3 === 1 ? "near" : "uniform";
     room.balises.push(createBaliseRecord(room, position, mixKind, now));
   }
-}
-
-function clampNum(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function gameMinutesForPowers(room) {
-  const s = room?.settings || {};
-  if (!s.timeLimitEnabled) return 30;
-  const mins = Number(s.timeLimitMinutes);
-  return Number.isFinite(mins) && mins >= 1 ? mins : 30;
-}
-
-function maxPowerSecForRoom(room) {
-  return clampNum(Math.round(gameMinutesForPowers(room) * 4), 45, 120);
-}
-
-function clampPowerDuration(sec, room, min = 5, fallback = 60) {
-  const max = maxPowerSecForRoom(room);
-  const raw = Number(sec);
-  const chosen = Number.isFinite(raw) && raw > 0 ? raw : Math.min(fallback, max);
-  return Math.max(min, Math.min(max, Math.round(chosen)));
-}
-
-function durationFactor60(durationSec) {
-  return Math.pow(Math.max(1, Number(durationSec) || 60) / 60, 1.6);
 }
 
 function gpsPlayers(room) {
@@ -312,114 +296,6 @@ function recordCoinTransaction(player, amount, source, reason) {
     player.coinHistory = player.coinHistory.slice(-100);
   }
 }
-
-function calculateAdaptivePhaseCount(timeLimitMinutes, globalRadiusM) {
-  const R0 = globalRadiusM || 500;
-  const Rmin = 70;
-  const gapMinimum = 15; // Minimum de réduction entre phases (mètres) pour que ce soit visible
-
-  // Base sur le temps : 1 phase tous les 5-6 minutes, min 3, max 8
-  const timeBasedCount = Math.min(Math.max(3, Math.floor(timeLimitMinutes / 5)), 8);
-
-  // Base sur le rayon : s'assurer que chaque réduction est significative
-  const radiusBasedCount = Math.floor((R0 - Rmin) / gapMinimum);
-
-  // Prendre le minimum des deux pour éviter trop de phases avec petits gaps
-  return Math.min(timeBasedCount, radiusBasedCount);
-}
-
-function calculateFinalWaitRatio(timeLimitMinutes) {
-  // Pour les parties courtes, réserver plus de temps pour la phase d'attente finale
-  // Minimum 1 minute d'attente, maximum 5% du temps total
-  const minWaitMinutes = 1;
-  const maxRatio = 0.05; // 5%
-
-  // Si la partie est très courte, réserver une plus grande proportion
-  if (timeLimitMinutes <= 10) {
-    // Pour 10 min ou moins, réserver au moins 1 minute (10% ou plus)
-    return Math.max(minWaitMinutes / timeLimitMinutes, maxRatio);
-  } else if (timeLimitMinutes <= 15) {
-    // Pour 10-15 min, réserver environ 8-10%
-    return Math.max(minWaitMinutes / timeLimitMinutes, 0.08);
-  } else {
-    // Pour les parties longues, garder 5%
-    return maxRatio;
-  }
-}
-
-function calculateDynamicCatDelay(timeLimitMinutes, globalRadiusM, playerCount) {
-  // Base: 2-3% of game duration
-  const baseRatio = 0.025; // 2.5%
-  const delayMs = timeLimitMinutes * baseRatio * 60 * 1000;
-
-  // Adjust based on circle size: larger circle = more time to spread out
-  const R0 = globalRadiusM || 500;
-  const radiusFactor = Math.max(1, R0 / 500); // 1x for 500m, 2x for 1000m, etc.
-
-  // Adjust based on player count: more players = slightly more time
-  const playerFactor = Math.max(1, playerCount / 4); // 1x for 4 players, 1.5x for 6 players
-
-  // Calculate final delay
-  const adjustedDelayMs = delayMs * radiusFactor * playerFactor;
-
-  // Apply caps based on game length
-  const minDelayMs = 2 * 60 * 1000; // 2 minutes minimum
-  const maxRatio = 0.08; // 8% of game duration maximum
-  const maxDelayMs = timeLimitMinutes * maxRatio * 60 * 1000;
-
-  // For very short games, cap at a lower percentage
-  if (timeLimitMinutes <= 10) {
-    const shortGameMaxMs = timeLimitMinutes * 0.05 * 60 * 1000; // 5% max for short games
-    return Math.max(minDelayMs, Math.min(adjustedDelayMs, shortGameMaxMs));
-  }
-
-  // For very long games, cap at a reasonable absolute value
-  if (timeLimitMinutes >= 120) {
-    const longGameMaxMs = 8 * 60 * 1000; // 8 minutes max for very long games
-    return Math.max(minDelayMs, Math.min(adjustedDelayMs, longGameMaxMs));
-  }
-
-  return Math.max(minDelayMs, Math.min(adjustedDelayMs, maxDelayMs));
-}
-
-function calculateForcedWaitForNewCat(timeLimitMinutes, remainingTimeMs) {
-  // For 2-player games, when a player becomes a cat after capture,
-  // force a wait time to prevent immediate revenge hunting
-  // Base: 1 minute minimum
-  const minWaitMs = 1 * 60 * 1000; // 1 minute
-
-  // Dynamic based on remaining time, but with less representation than initial cat wait
-  // Use 1.5% of remaining time instead of 2.5%
-  const dynamicRatio = 0.015; // 1.5%
-  const dynamicWaitMs = remainingTimeMs * dynamicRatio;
-
-  // Cap at 3 minutes maximum to keep it reasonable
-  const maxWaitMs = 3 * 60 * 1000;
-
-  return Math.max(minWaitMs, Math.min(dynamicWaitMs, maxWaitMs));
-}
-
-const defaultSettings = () => {
-  const settings = {
-  globalRadiusM: 500,
-  jamRadiusM: 80,
-  catCount: 1,
-  catDelayMinutes: 0, // 0 = use dynamic calculation
-  /** Zone globale qui rétrécit avec le temps */
-  shrinkZoneEnabled: false,
-  /** Fin forcée après X minutes (désactivable) */
-  timeLimitEnabled: false,
-  timeLimitMinutes: 30,
-  /** random | manual — en manuel, l'hôte définit les chats avant « Démarrer la chasse » */
-  catAssignmentMode: "random",
-  gameMode: "tag_swap",
-  minBeaconSpacingM: BALISE_MIN_SEPARATION_BASE_M,
-  minBeaconSpawnDistanceM: DEFAULT_BEACON_SPAWN_DISTANCE_M,
-  /** Réservé à l'hôte : aperçu carte avec les mêmes cercles que les chats */
-  hostCatMapPreview: false,
-  };
-  return settings;
-};
 
 /** Paliers de rayon + métadonnées pour l'UI (phase suivante, fin de palier). */
 function getShrinkState(room) {
@@ -1640,7 +1516,7 @@ export function createRoomsStore({
       lastCoinsLostAtBounds: 0,
       powerCooldowns: {},
     };
-    const settings = defaultSettings();
+    const settings = defaultSettings(BALISE_MIN_SEPARATION_BASE_M, DEFAULT_BEACON_SPAWN_DISTANCE_M);
     const room = {
       code,
       hostId: socketId,
