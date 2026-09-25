@@ -6,40 +6,12 @@ import helmet from "helmet";
 import { Server } from "socket.io";
 import { createRoomsStore } from "./rooms.js";
 import { corsOriginOption } from "./corsConfig.js";
+import { createRateLimiter } from "./rateLimiter.js";
+import { registerRecapRoutes } from "./recaps.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import { saveActiveRoom, getActiveRooms, deleteActiveRoom, saveSession, deleteSession } from "./supabase.js";
 
-// Simple rate limiting for Socket.io events
-const rateLimiter = new Map();
-const RATE_LIMIT_WINDOW = 60000; // 1 minute
-const RATE_LIMIT_MAX = 100; // Max 100 events per minute per socket
-const ADMIN_RATE_LIMIT_MAX = 10; // Max 10 admin actions per minute (stricter)
-
-function checkRateLimit(socketId, eventName) {
-  const key = `${socketId}:${eventName}`;
-  const now = Date.now();
-  const windowStart = now - RATE_LIMIT_WINDOW;
-  
-  if (!rateLimiter.has(key)) {
-    rateLimiter.set(key, []);
-  }
-  
-  const events = rateLimiter.get(key);
-  // Remove old events outside the window
-  const recentEvents = events.filter(t => t > windowStart);
-  rateLimiter.set(key, recentEvents);
-  
-  // Use stricter limit for admin functions
-  const maxLimit = eventName.startsWith('admin_') ? ADMIN_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
-  
-  if (recentEvents.length >= maxLimit) {
-    console.warn(`Rate limit exceeded for ${eventName} from socket ${socketId}`);
-    return false; // Rate limited
-  }
-  
-  recentEvents.push(now);
-  return true;
-}
+const checkRateLimit = createRateLimiter();
 
 const PORT = Number(process.env.PORT) || 3001;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -76,63 +48,7 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-const RECAP_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const recapStore = new Map();
-const MAX_RECAPS = 400;
-
-function randomRecapId(len = 8) {
-  let s = "";
-  for (let i = 0; i < len; i++) {
-    s += RECAP_CHARS[Math.floor(Math.random() * RECAP_CHARS.length)];
-  }
-  return s;
-}
-
-app.post("/api/recap", async (req, res) => {
-  try {
-    const body = req.body;
-    if (!body || typeof body !== "object") {
-      return res.status(400).json({ error: "invalid_body" });
-    }
-    let id = randomRecapId(8);
-    if (supabase) {
-      const { error } = await supabase.from("game_recaps").insert({ id, summary: body });
-      if (!error) {
-        return res.json({ id });
-      }
-      console.error("supabase_insert_error", error?.message || error);
-    }
-    while (recapStore.has(id)) id = randomRecapId(8);
-    recapStore.set(id, { at: Date.now(), summary: body });
-    while (recapStore.size > MAX_RECAPS) {
-      const oldest = [...recapStore.entries()].sort((a, b) => a[1].at - b[1].at)[0];
-      recapStore.delete(oldest[0]);
-    }
-    return res.json({ id });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "server" });
-  }
-});
-
-app.get("/api/recap/:id", async (req, res) => {
-  const id = String(req.params.id || "").toUpperCase();
-  if (supabase) {
-    const { data, error } = await supabase
-      .from("game_recaps")
-      .select("summary")
-      .eq("id", id)
-      .maybeSingle();
-    if (error) {
-      console.error("supabase_select_error", error?.message || error);
-    } else if (data && data.summary) {
-      return res.json(data.summary);
-    }
-  }
-  const row = recapStore.get(id);
-  if (!row?.summary) return res.status(404).json({ error: "not_found" });
-  return res.json(row.summary);
-});
+registerRecapRoutes(app, { supabase });
 
 const server = http.createServer(app);
 const io = new Server(server, {
