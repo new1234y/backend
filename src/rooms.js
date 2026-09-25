@@ -12,6 +12,24 @@ import {
   createFallbackBeaconPosition,
   findAccessibleBeaconPosition,
 } from "./beacons.js";
+import {
+  gpsPlayers as domainGpsPlayers,
+  assignPlayerColors as domainAssignPlayerColors,
+  recordCoinTransaction as domainRecordCoinTransaction,
+  randomCode as domainRandomCode,
+  isValidCoordinates as domainIsValidCoordinates,
+} from "./players.js";
+import {
+  maxPowerSecForRoom as domainMaxPowerSecForRoom,
+  clampPowerDuration as domainClampPowerDuration,
+  durationFactor60 as domainDurationFactor60,
+  calculateAdaptivePhaseCount as domainCalculateAdaptivePhaseCount,
+  calculateFinalWaitRatio as domainCalculateFinalWaitRatio,
+  calculateDynamicCatDelay as domainCalculateDynamicCatDelay,
+  calculateForcedWaitForNewCat as domainCalculateForcedWaitForNewCat,
+} from "./powers.js";
+import { serializeBalises as domainSerializeBalises } from "./serialization.js";
+import { effectiveGlobalRadiusAtTimestamp as domainEffectiveGlobalRadiusAtTimestamp } from "./visibility.js";
 
 export { beaconCountForPlayers, findAccessibleBeaconPosition };
 
@@ -128,7 +146,7 @@ function createBaliseRecord(room, position, mixKind, now) {
 }
 
 function immediateFallbackBalises(room, center, radiusM, count, now) {
-  const players = gpsPlayers(room);
+  const players = domainGpsPlayers(room);
   for (let i = 0; i < count; i += 1) {
     const position = createFallbackBeaconPosition(center, radiusM, {
       existingBeacons: room.balises,
@@ -735,7 +753,7 @@ function isOsmCandidateSafe(candidate, blockedAreas, room, effectiveCenter, effe
 }
 
 async function fetchOsmBaliseCandidates(center, radiusM, maxRetries = 2) {
-  if (!isValidCoordinates(center.lat, center.lng)) {
+  if (!domainIsValidCoordinates(center.lat, center.lng)) {
     console.warn('Invalid coordinates for OSM balise candidates:', center);
     return { walkways: [], crossingNodes: [], blockedAreas: [] };
   }
@@ -867,13 +885,13 @@ async function spawnBalise(room, spawnAt = null) {
   const baliseRadiusM = BALISE_RADIUS_M;
   if (!Array.isArray(room.balises)) room.balises = [];
   const live = room.balises.filter((b) => !b.expiresAt || now < b.expiresAt);
-  const targetCount = room.baliseTargetCount || beaconCountForPlayers(gpsPlayers(room).length);
+  const targetCount = room.baliseTargetCount || beaconCountForPlayers(domainGpsPlayers(room).length);
   const hasLure = room.nextBaliseOverride &&
     Number.isFinite(room.nextBaliseOverride.lat) &&
     Number.isFinite(room.nextBaliseOverride.lng);
   if (live.length >= targetCount && !hasLure) return null;
 
-  const players = gpsPlayers(room);
+  const players = domainGpsPlayers(room);
   let mixKind = sampleBaliseMixKind();
   const nearAnchor = mixKind === "near" && players.length
     ? players[Math.floor(Math.random() * players.length)]
@@ -1018,7 +1036,7 @@ function updateBalises(room, io) {
         balise.beingCapturedBy = null;
         const award = Number(balise.awardedCoins) || Number(balise.rewardCoins) || 20;
         capturer.coins = (capturer.coins || 0) + award;
-        recordCoinTransaction(capturer, award, "balise", "Capture de balise");
+        domainRecordCoinTransaction(capturer, award, "balise", "Capture de balise");
         pushTimeline(room, {
           type: "balise_captured",
           baliseId: balise.id,
@@ -1077,7 +1095,7 @@ function updateBalises(room, io) {
   }
 
   const live = (room.balises || []).filter((b) => !b.expiresAt || now < b.expiresAt);
-  const targetCount = room.baliseTargetCount || beaconCountForPlayers(gpsPlayers(room).length);
+  const targetCount = room.baliseTargetCount || beaconCountForPlayers(domainGpsPlayers(room).length);
   const placementRetryBlocked = room.lastBalisePlacementErrorAt &&
     now - room.lastBalisePlacementErrorAt < BALISE_PLACEMENT_RETRY_DELAY_MS;
   const hasLure = room.nextBaliseOverride &&
@@ -1216,7 +1234,7 @@ function computePlayerAnalytics(room, timeline) {
           }
         }
         if (gameCenter) {
-          const radius = effectiveGlobalRadiusAtTimestamp(room, point.t);
+          const radius = domainEffectiveGlobalRadiusAtTimestamp(room, point.t);
           if (!isInsideRadius(point.lat, point.lng, gameCenter, radius)) {
             outsideMs += dt;
           }
@@ -1397,7 +1415,7 @@ function buildGameSummary(room) {
           endZone: ph.endZone ? { ...ph.endZone, center: { ...ph.endZone.center } } : null,
         }))
       : null,
-    balises: serializeBalises(room),
+    balises: domainSerializeBalises(room),
     analytics,
   };
 }
@@ -1610,7 +1628,7 @@ export function createRoomsStore({
     leaveRoom(socketId);
     let code;
     do {
-      code = randomCode(5);
+      code = domainRandomCode(CODE_CHARS, 5);
     } while (rooms.has(code));
     const sessionId = uuidv4();
     const player = {
@@ -2020,10 +2038,10 @@ export function createRoomsStore({
       const timeLimitMs = Math.max(1, Number(room.settings.timeLimitMinutes) || 30) * 60 * 1000;
       const R0 = Number(room.settings.globalRadiusM) || 500;
       const Rmin = 70;
-      const phaseCount = calculateAdaptivePhaseCount(room.settings.timeLimitMinutes || 30, R0);
+      const phaseCount = domainCalculateAdaptivePhaseCount(room.settings.timeLimitMinutes || 30, R0);
 
       // Réserver un pourcentage adaptatif du temps total pour la phase d'attente finale à 70m
-      const finalWaitRatio = calculateFinalWaitRatio(room.settings.timeLimitMinutes || 30);
+      const finalWaitRatio = domainCalculateFinalWaitRatio(room.settings.timeLimitMinutes || 30);
       const shrinkTimeMs = timeLimitMs * (1 - finalWaitRatio); // Le reste pour le rétrécissement
       const finalWaitTimeMs = timeLimitMs * finalWaitRatio; // Pourcentage adaptatif pour l'attente finale
       
@@ -2137,7 +2155,7 @@ export function createRoomsStore({
     room.initialPlayerCount = list.filter((p) => !p.spectator).length;
     room.initialRemainingPlayerCount = list.filter((p) => p.role === "player" && !p.spectator).length;
     room.lastBaliseSpawnAt = null;
-    assignPlayerColors(room);
+    domainAssignPlayerColors(room);
     pushTimeline(room, {
       type: "hunt_started",
       message: "La chasse a commencé",
@@ -2146,7 +2164,7 @@ export function createRoomsStore({
     const timeLimitMinutes = Math.max(1, Number(room.settings.timeLimitMinutes) || 30);
     const globalRadiusM = Number(room.settings.globalRadiusM) || 500;
     const playerCount = list.filter((p) => !p.spectator).length;
-    const dynamicDelayMs = calculateDynamicCatDelay(timeLimitMinutes, globalRadiusM, playerCount);
+    const dynamicDelayMs = domainCalculateDynamicCatDelay(timeLimitMinutes, globalRadiusM, playerCount);
     // Allow manual override via catDelayMinutes setting if set
     const manualDelayMs = Math.max(0, Number(room.settings.catDelayMinutes) || 0) * 60 * 1000;
     const delayMs = manualDelayMs > 0 ? manualDelayMs : dynamicDelayMs;
@@ -2356,7 +2374,7 @@ export function createRoomsStore({
           p.coins = Math.max(0, (p.coins || 0) - coinsLost);
           p.lastCoinsLostAtBounds = coinsToLose;
           p.justLostCoins = true; // Flag to trigger client update
-          recordCoinTransaction(p, -coinsLost, "out_of_bounds", "Perte hors zone");
+          domainRecordCoinTransaction(p, -coinsLost, "out_of_bounds", "Perte hors zone");
           pushTimeline(room, {
             type: "coins_lost_out_of_bounds",
             sessionId: p.sessionId,
@@ -2518,15 +2536,15 @@ export function createRoomsStore({
       spectators: [],
       adminPreyPreview: null,
       partyChat: [...(room.partyChat || [])].slice(-80),
-      balises: serializeBalises(room),
+      balises: domainSerializeBalises(room),
       nextBaliseAt: (() => {
         const live = (room.balises || []).filter((b) => !b.expiresAt || now < b.expiresAt);
-        const targetCount = room.baliseTargetCount || beaconCountForPlayers(gpsPlayers(room).length);
+        const targetCount = room.baliseTargetCount || beaconCountForPlayers(domainGpsPlayers(room).length);
         if (live.length < targetCount) return now;
         const times = live.map((b) => b.expiresAt).filter((t) => Number.isFinite(t));
         return times.length ? Math.min(...times) : (room.lastBaliseSpawnAt ? room.lastBaliseSpawnAt + 2 * 60 * 1000 : null);
       })(),
-      maxPowerSec: maxPowerSecForRoom(room),
+      maxPowerSec: domainMaxPowerSecForRoom(room),
       powerLimits: room.powerMaxUses || {},
       powerUses: room.powerUses?.[viewer.sessionId] || {},
     };
@@ -2907,8 +2925,8 @@ export function createRoomsStore({
     prey.coins = 0;
     cat.coins = (cat.coins || 0) + preyCoins;
     if (preyCoins > 0) {
-      recordCoinTransaction(prey, -preyCoins, "capture", `Capture par ${cat.nickname}`);
-      recordCoinTransaction(cat, preyCoins, "capture", `Capture de ${prey.nickname}`);
+      domainRecordCoinTransaction(prey, -preyCoins, "capture", `Capture par ${cat.nickname}`);
+      domainRecordCoinTransaction(cat, preyCoins, "capture", `Capture de ${prey.nickname}`);
     }
     
     const mode = room.settings.gameMode || "tag_swap";
@@ -2939,7 +2957,7 @@ export function createRoomsStore({
         const remainingTimeMs = room.settings.timeLimitEnabled && room.huntStartedAt
           ? Math.max(0, (room.huntStartedAt + timeLimitMinutes * 60 * 1000) - now)
           : timeLimitMinutes * 60 * 1000;
-        const forcedWaitMs = calculateForcedWaitForNewCat(timeLimitMinutes, remainingTimeMs);
+        const forcedWaitMs = domainCalculateForcedWaitForNewCat(timeLimitMinutes, remainingTimeMs);
         prey.forcedWaitTimeMs = forcedWaitMs;
         prey.captureCooldownUntil = now + forcedWaitMs;
         console.log(`2-player game: New cat ${prey.nickname} will wait ${Math.round(forcedWaitMs / 1000)}s before hunting`);
@@ -3138,7 +3156,7 @@ export function createRoomsStore({
 
     // Réserver un pourcentage adaptatif du temps restant pour la phase d'attente finale à 70m
     const remainingMinutes = remainingMs / (60 * 1000);
-    const finalWaitRatio = calculateFinalWaitRatio(remainingMinutes);
+    const finalWaitRatio = domainCalculateFinalWaitRatio(remainingMinutes);
     const shrinkRemainingMs = remainingMs * (1 - finalWaitRatio); // Le reste pour le rétrécissement
     const finalWaitRemainingMs = remainingMs * finalWaitRatio; // Pourcentage adaptatif pour l'attente finale
 
@@ -3146,7 +3164,7 @@ export function createRoomsStore({
       ? room.shrinkPhasesList.filter((ph) => (room.huntStartedAt + ph.endTime) <= now)
       : [];
 
-    const count = calculateAdaptivePhaseCount(remainingMs / (60 * 1000), R0now);
+    const count = domainCalculateAdaptivePhaseCount(remainingMs / (60 * 1000), R0now);
 
     let currentCenter = shrink.currentCenter || room.gameCenter;
     const zones = [];
@@ -3457,7 +3475,7 @@ export function createRoomsStore({
     const ensureCoins = (p, cost, powerName = "power") => {
       if ((p.coins || 0) < cost) return false;
       p.coins = (p.coins || 0) - cost;
-      recordCoinTransaction(p, -cost, "power", `Pouvoir: ${powerName}`);
+      domainRecordCoinTransaction(p, -cost, "power", `Pouvoir: ${powerName}`);
       return true;
     };
     const findBySessionId = (sid) => {
@@ -3536,7 +3554,7 @@ export function createRoomsStore({
         .filter((t) => t && t.sessionId !== actor.sessionId && t.role === "player" && !t.spectator);
       if (!targets.length) return { error: "Cible introuvable." };
 
-      const maxSec = maxPowerSecForRoom(room);
+      const maxSec = domainMaxPowerSecForRoom(room);
       const requestedDuration = Number(body?.durationSec);
       const durationSec = Math.max(
         1,
@@ -3606,9 +3624,9 @@ export function createRoomsStore({
       if (body?.targetSessionId != null || Array.isArray(body?.targetSessionIds)) {
         return { error: "L'invisibilité ne peut cibler que soi-même." };
       }
-      const durationSec = Math.min(90, clampPowerDuration(body?.durationSec, room, 15, 60));
+      const durationSec = Math.min(90, domainClampPowerDuration(body?.durationSec, room, 15, 60));
       const until = now + durationSec * 1000;
-      const durationFactor = durationFactor60(durationSec); // 60s = coût de base
+      const durationFactor = domainDurationFactor60(durationSec); // 60s = coût de base
       const targets = [actor];
 
       const base = Number(room.powerCosts?.invisibility_self || 40);
@@ -3753,7 +3771,7 @@ export function createRoomsStore({
       }
       if (onCooldown(actor, "no_boundaries")) return { error: "Recharge en cours." };
       if (!ensureCoins(actor, Number(room.powerCosts?.no_boundaries || 80))) return { error: "Pas assez de pièces." };
-      const durationSec = clampPowerDuration(body?.durationSec, room, 30, 60);
+      const durationSec = domainClampPowerDuration(body?.durationSec, room, 30, 60);
       actor.outOfBoundsOverrideUntil = now + durationSec * 1000;
       pushTimeline(room, { type: "power_no_boundaries", bySessionId: actor.sessionId, durationSec });
       setCooldown(actor, "no_boundaries", 300);
@@ -3767,7 +3785,7 @@ export function createRoomsStore({
       if (scope !== "single" || Array.isArray(body?.targetSessionIds)) {
         return { error: "Une seule cible explicite est autorisée." };
       }
-      const durationSec = clampPowerDuration(body?.durationSec, room, 5, 20);
+      const durationSec = domainClampPowerDuration(body?.durationSec, room, 5, 20);
       const sid = String(body?.targetSessionId || "");
       const target = findBySessionId(sid);
       if (!target || target.spectator || target.role !== (actor.role === "cat" ? "player" : "cat")) {
@@ -3834,7 +3852,7 @@ export function createRoomsStore({
       }
       if (onCooldown(actor, "fake_position")) return { error: "Leurre en recharge." };
 
-      const durationSec = clampPowerDuration(body?.durationSec, room, 15, 60);
+      const durationSec = domainClampPowerDuration(body?.durationSec, room, 15, 60);
       const cost = Number(room.powerCosts?.fake_position || 60);
 
       if (!chargePower(actor, "fake_position", cost, "fake_position")) return { error: "Pas assez de pièces." };
@@ -3932,7 +3950,7 @@ export function createRoomsStore({
     const d = Math.floor(Number(delta || 0));
     if (!Number.isFinite(d)) return { error: "Delta invalide." };
     target.coins = Math.max(0, (target.coins || 0) + d);
-    recordCoinTransaction(target, d, "admin", `Ajustement admin: ${d > 0 ? '+' : ''}${d}`);
+    domainRecordCoinTransaction(target, d, "admin", `Ajustement admin: ${d > 0 ? '+' : ''}${d}`);
     pushTimeline(room, { type: "admin_adjust_coins", bySessionId: room.players.get(room.hostId)?.sessionId, targetSessionId, delta: d });
     broadcastPlayingState(io, room);
     return { ok: true, coins: target.coins };
