@@ -45,10 +45,10 @@ app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json({ limit: '1mb' })); // Limit JSON body size to prevent DoS
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, persistenceAvailable: Boolean(supabase) });
 });
 
-registerRecapRoutes(app, { supabase });
+const recapStore = registerRecapRoutes(app, { supabase });
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -58,6 +58,7 @@ const io = new Server(server, {
 });
 
 const store = createRoomsStore({
+  completedSummaryStore: recapStore,
   onSessionInvalidated: (sessionId) => {
     sessionRegistry.delete(sessionId);
   },

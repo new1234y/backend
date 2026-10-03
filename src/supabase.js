@@ -58,6 +58,24 @@ export async function saveGameSummary(gameSummary) {
   }
 }
 
+export async function saveGameRecap(code, summary) {
+  if (!supabase) return false;
+
+  try {
+    const { error } = await supabase
+      .from('game_recaps')
+      .upsert({ id: code, summary }, { onConflict: 'id' });
+    if (error) {
+      console.error('Error saving complete game recap to Supabase:', error);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error('Failed to save complete game recap to Supabase:', error);
+    return false;
+  }
+}
+
 export async function getGameHistory(limit = 10) {
   if (!supabase) {
     console.warn('Supabase not available, returning empty game history');

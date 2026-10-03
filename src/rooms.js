@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
-import { saveGameSummary, saveGameMessage, saveTimelineEvent, saveSession, deleteSession, deleteActiveRoom, saveActivePower, removeActivePower, getActivePowers, cleanupExpiredPowers } from "./supabase.js";
+import { saveGameSummary, saveGameRecap, saveGameMessage, saveTimelineEvent, saveSession, deleteSession, deleteActiveRoom, saveActivePower, removeActivePower, getActivePowers, cleanupExpiredPowers } from "./supabase.js";
+import { rememberRecap } from "./recaps.js";
 import {
   haversineMeters,
   randomOffsetPoint,
@@ -149,7 +150,17 @@ function immediateFallbackBalises(room, center, radiusM, count, now) {
       isInsideZone: (lat, lng) => isInsideGameZone(lat, lng, room),
     });
     const mixKind = i % 3 === 0 ? "far" : i % 3 === 1 ? "near" : "uniform";
-    room.balises.push(createBaliseRecord(room, position, mixKind, now));
+    const balise = createBaliseRecord(room, position, mixKind, now);
+    room.balises.push(balise);
+    pushTimeline(room, {
+      type: "balise_spawned",
+      baliseId: balise.id,
+      baliseType: balise.type,
+      radiusM: balise.radiusM,
+      captureDurationMs: balise.captureDurationMs,
+      lat: balise.lat,
+      lng: balise.lng,
+    });
   }
 }
 
@@ -468,9 +479,9 @@ function isInsideGameZone(lat, lng, room) {
 function pushTimeline(room, evt) {
   if (!room.timelineEvents) room.timelineEvents = [];
   room.timelineEvents.push({ t: Date.now(), ...evt });
-  // Keep only last 100 timeline events to reduce memory
-  if (room.timelineEvents.length > 100) {
-    room.timelineEvents.splice(0, room.timelineEvents.length - 100);
+  // Keep enough history for complete end-of-game recaps without unbounded growth.
+  if (room.timelineEvents.length > 2000) {
+    room.timelineEvents.splice(0, room.timelineEvents.length - 2000);
   }
   // Save to Supabase for long-term persistence
   saveTimelineEvent(room.code, evt.type, evt).catch(e => {
@@ -824,6 +835,11 @@ async function spawnBalise(room, spawnAt = null) {
   pushTimeline(room, {
     type: "balise_spawned",
     baliseId: balise.id,
+    baliseType: balise.type,
+    radiusM: balise.radiusM,
+    captureDurationMs: balise.captureDurationMs,
+    lat: balise.lat,
+    lng: balise.lng,
   });
   return balise;
 }
@@ -863,6 +879,16 @@ function updateBalises(room, io) {
 
   for (const balise of room.balises) {
     if (balise.expiresAt && now >= balise.expiresAt) {
+      pushTimeline(room, {
+        type: "balise_expired",
+        baliseId: balise.id,
+        baliseType: balise.type,
+        radiusM: balise.radiusM,
+        captureDurationMs: balise.captureDurationMs,
+        progress: Math.min(1, balise.captureProgress / (Number(balise.captureDurationMs) || BALISE_CAPTURE_DURATION_MS)),
+        lat: balise.lat,
+        lng: balise.lng,
+      });
       toRemove.push(balise.id);
       continue;
     }
@@ -889,6 +915,23 @@ function updateBalises(room, io) {
       room._baliseBlockedId = null;
       balise.captureProgress += 1000;
       const captureTime = Number(balise.captureDurationMs) || BALISE_CAPTURE_DURATION_MS;
+      if (!balise._lastCaptureProgressTimelineAt ||
+          now - balise._lastCaptureProgressTimelineAt >= 5000 ||
+          balise.captureProgress >= captureTime) {
+        balise._lastCaptureProgressTimelineAt = now;
+        pushTimeline(room, {
+          type: "balise_capture_progress",
+          baliseId: balise.id,
+          baliseType: balise.type,
+          radiusM: balise.radiusM,
+          captureDurationMs: captureTime,
+          progress: Math.min(1, balise.captureProgress / captureTime),
+          sessionId: capturer.sessionId,
+          nickname: capturer.nickname,
+          lat: capturer.lat,
+          lng: capturer.lng,
+        });
+      }
       if (balise.captureProgress >= captureTime) {
         balise.capturedBy = capturer.sessionId;
         balise.beingCapturedBy = null;
@@ -902,6 +945,12 @@ function updateBalises(room, io) {
           nickname: capturer.nickname,
           role: capturer.role,
           awardedCoins: award,
+          baliseType: balise.type,
+          radiusM: balise.radiusM,
+          captureDurationMs: captureTime,
+          progress: 1,
+          lat: capturer.lat,
+          lng: capturer.lng,
         });
         try {
           if (io && room.code) {
@@ -940,8 +989,22 @@ function updateBalises(room, io) {
       }
     } else if (inside.length) {
       const starter = inside[0];
+      const captureTime = Number(balise.captureDurationMs) || BALISE_CAPTURE_DURATION_MS;
       balise.beingCapturedBy = starter.sessionId;
       balise.captureProgress = 1000;
+      balise._lastCaptureProgressTimelineAt = now;
+      pushTimeline(room, {
+        type: "balise_capture_started",
+        baliseId: balise.id,
+        baliseType: balise.type,
+        radiusM: balise.radiusM,
+        captureDurationMs: captureTime,
+        progress: Math.min(1, balise.captureProgress / captureTime),
+        sessionId: starter.sessionId,
+        nickname: starter.nickname,
+        lat: starter.lat,
+        lng: starter.lng,
+      });
     } else {
       balise.beingCapturedBy = null;
       balise.captureProgress = 0;
@@ -988,7 +1051,12 @@ function appendLocationSample(room, player) {
   const t = Date.now();
   const last = arr[arr.length - 1];
   if (last && t - last.t < 1200) return;
-  arr.push({ t, lat: player.lat, lng: player.lng });
+  const heading = Number.isFinite(player.heading)
+    ? player.heading
+    : last && Number.isFinite(last.lat) && Number.isFinite(last.lng)
+      ? bearingDeg(last, player)
+      : null;
+  arr.push({ t, lat: player.lat, lng: player.lng, heading, bearing: heading });
   if (arr.length > 6000) arr.splice(0, arr.length - 6000);
 }
 
@@ -1343,6 +1411,7 @@ function buildGameSummary(room) {
 export function createRoomsStore({
   onSessionInvalidated,
   onRoomNuked,
+  completedSummaryStore = null,
 } = {}) {
   const rooms = new Map();
   const socketToRoom = new Map();
@@ -2094,7 +2163,7 @@ export function createRoomsStore({
     return { ok: true, room };
   }
 
-  function finishGame(io, room, reason = "natural") {
+  async function finishGame(io, room, reason = "natural") {
     if (room.phase !== "playing") return;
     const now = Date.now();
     for (const p of room.players.values()) {
@@ -2119,9 +2188,13 @@ export function createRoomsStore({
       message: msg,
     });
     const summary = buildGameSummary(room);
+    if (completedSummaryStore) {
+      rememberRecap(completedSummaryStore, summary.code, summary);
+    }
     
     // Save to Supabase
-    saveGameSummary({
+    const persistence = Promise.all([
+      saveGameSummary({
       code: summary.code,
       huntStartedAt: summary.huntStartedAt,
       endedAt: summary.endedAt,
@@ -2136,9 +2209,15 @@ export function createRoomsStore({
       shrinkPhasesList: summary.shrinkPhasesList,
       balises: summary.balises,
       analytics: summary.analytics,
-    }).catch((err) => {
+      }),
+      saveGameRecap(summary.code, summary),
+    ]).catch((err) => {
       console.error('Failed to save game summary to Supabase:', err);
     });
+    await Promise.race([
+      persistence,
+      new Promise((resolve) => setTimeout(resolve, 2500)),
+    ]);
 
     // Delete room from active_rooms in Supabase since it's finished
     deleteActiveRoom(room.code).catch(e => {
@@ -2306,8 +2385,13 @@ export function createRoomsStore({
     }
   }
 
+  if (p.lat != null && p.lng != null) {
+    p.heading = bearingDeg(p, { lat: la, lng: lo });
+    p.bearing = p.heading;
+  }
   p.lat = la;
   p.lng = lo;
+  if (room.phase === "playing") appendLocationSample(room, p);
   return { room, player: p };
 }
 
