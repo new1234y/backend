@@ -1058,8 +1058,16 @@ function computePlayerAnalytics(room, timeline) {
   const gameDurationMs =
     huntStart != null ? Math.max(0, effectiveEnd - huntStart) : null;
 
-  // Use the actual initial cat delay from the room if available, otherwise calculate
-  const waitTimeToExcludeMs = room.initialCatDelayMs || calculateWaitTimeToExclude(gameDurationMs);
+  // The initial cat delay is outside the active playing window. Prefer the
+  // recorded value so recap timing matches the game that actually ran.
+  const waitTimeToExcludeMs =
+    room.initialCatDelayMs != null
+      ? Math.max(0, Number(room.initialCatDelayMs) || 0)
+      : calculateWaitTimeToExclude(gameDurationMs);
+  const activeStart =
+    huntStart != null ? Math.min(effectiveEnd, huntStart + waitTimeToExcludeMs) : null;
+  const activeDurationMs =
+    activeStart != null ? Math.max(0, effectiveEnd - activeStart) : null;
   
   let totalDistance = 0;
 
@@ -1149,21 +1157,76 @@ function computePlayerAnalytics(room, timeline) {
         lastKnownPosition: null,
       };
     }
-    let catTime = player.catTimeMs || 0;
-
-    // Exclure le temps d'attente initial pour tous les chats (la carte est verrouillée pour tous)
-    if (waitTimeToExcludeMs > 0) {
-      catTime = Math.max(0, catTime - waitTimeToExcludeMs);
-    }
-
-    // Exclure le temps d'attente forcé après capture (pour parties à 2 joueurs)
-    const forcedWaitTimeMs = player.forcedWaitTimeMs || 0;
-    if (forcedWaitTimeMs > 0) {
-      catTime = Math.max(0, catTime - forcedWaitTimeMs);
-    }
-    
-    totalCatTimeMs += catTime;
     const playerEvents = eventsBySession[sid] || [];
+    let timeAsPlayerMs = null;
+    let catTime = null;
+    if (activeStart != null && activeDurationMs != null) {
+      let role =
+        player.originalRole === "cat" ||
+        (player.originalRole == null && player.role === "cat")
+          ? "cat"
+          : "player";
+      let playerTime = 0;
+      let cursor = activeStart;
+      const gameMode = room.settings?.gameMode || "tag_swap";
+      const roleEvents = orderedTimeline
+        .filter(
+          (ev) =>
+            ev &&
+            Number.isFinite(ev.t) &&
+            ((ev.sessionId === sid &&
+              (ev.type === "captured" ||
+                ev.type === "became_cat" ||
+                ev.type === "role_changed" ||
+                ev.type === "admin_role_pick")) ||
+              (gameMode === "tag_swap" &&
+                ev.type === "captured" &&
+                ev.bySessionId === sid)),
+        )
+        .sort((a, b) => a.t - b.t);
+
+      for (const ev of roleEvents) {
+        if (ev.t < activeStart) {
+          if (
+            (ev.type === "role_changed" || ev.type === "admin_role_pick") &&
+            ev.sessionId === sid
+          ) {
+            role = ev.to === "cat" ? "cat" : "player";
+            if (ev.type === "admin_role_pick") {
+              role = ev.role === "cat" ? "cat" : "player";
+            }
+          } else if (ev.type === "became_cat" && ev.sessionId === sid) {
+            role = "cat";
+          } else if (ev.type === "captured") {
+            if (ev.sessionId === sid) role = "cat";
+            if (gameMode === "tag_swap" && ev.bySessionId === sid) role = "player";
+          }
+          continue;
+        }
+        if (ev.t > effectiveEnd) break;
+        if (role === "player") playerTime += ev.t - cursor;
+        cursor = ev.t;
+        if (
+          (ev.type === "role_changed" || ev.type === "admin_role_pick") &&
+          ev.sessionId === sid
+        ) {
+          role = ev.to === "cat" ? "cat" : "player";
+          if (ev.type === "admin_role_pick") {
+            role = ev.role === "cat" ? "cat" : "player";
+          }
+        } else if (ev.type === "became_cat" && ev.sessionId === sid) {
+          role = "cat";
+        } else if (ev.type === "captured") {
+          if (ev.sessionId === sid) role = "cat";
+          if (gameMode === "tag_swap" && ev.bySessionId === sid) role = "player";
+        }
+      }
+      if (role === "player") playerTime += Math.max(0, effectiveEnd - cursor);
+      timeAsPlayerMs = Math.min(activeDurationMs, Math.max(0, playerTime));
+      catTime = activeDurationMs - timeAsPlayerMs;
+    }
+
+    totalCatTimeMs += catTime || 0;
     metrics[sid] = {
       ...metrics[sid],
       nickname: player.nickname,
@@ -1174,8 +1237,7 @@ function computePlayerAnalytics(room, timeline) {
       coins: player.coins || 0,
       coinHistory: player.coinHistory || [],
       catTimeMs: catTime,
-      timeAsPlayerMs:
-        gameDurationMs != null ? Math.max(0, gameDurationMs - catTime) : null,
+      timeAsPlayerMs,
       eventLog: playerEvents,
       catTransitions: playerEvents
         .filter((e) => e.type === "became_cat")
