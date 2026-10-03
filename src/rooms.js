@@ -1041,7 +1041,7 @@ function updateBalises(room, io) {
   }
 }
 
-function appendLocationSample(room, player) {
+function appendLocationSample(room, player, force = false) {
   if (room.phase !== "playing") return;
   if (player.lat == null || player.lng == null) return;
   if (!room.traceBySession) room.traceBySession = {};
@@ -1050,7 +1050,7 @@ function appendLocationSample(room, player) {
   const arr = room.traceBySession[id];
   const t = Date.now();
   const last = arr[arr.length - 1];
-  if (last && t - last.t < 1200) return;
+  if (!force && last && t - last.t < 1200) return;
   const heading = Number.isFinite(player.heading)
     ? player.heading
     : last && Number.isFinite(last.lat) && Number.isFinite(last.lng)
@@ -2125,6 +2125,9 @@ export function createRoomsStore({
     }
 
     room.traceBySession = {};
+    for (const player of list) {
+      appendLocationSample(room, player);
+    }
     room.jamHistory = [];
     room._lastJamSample = {};
     room.balises = [];
@@ -2166,6 +2169,9 @@ export function createRoomsStore({
   async function finishGame(io, room, reason = "natural") {
     if (room.phase !== "playing") return;
     const now = Date.now();
+    for (const player of room.players.values()) {
+      appendLocationSample(room, player, true);
+    }
     for (const p of room.players.values()) {
       if (p.role === "cat" && p.catSince) {
         p.catTimeMs = (p.catTimeMs || 0) + (now - p.catSince);
